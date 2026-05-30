@@ -1,0 +1,190 @@
+"""
+db.py — Async SQLAlchemy engine + session factory + claim helper.
+
+Two connection modes:
+
+  * Local / VM:  plain asyncpg DSN built from DB_HOST/DB_PORT/etc.
+  * Cloud Run:   cloud-sql-python-connector with IAM auth (ADC). Triggered
+                 by INSTANCE_CONNECTION_NAME being set.
+
+The claim helper uses `SELECT ... FOR UPDATE SKIP LOCKED` so two sweep
+instances can safely run concurrently without ever grabbing the same row.
+"""
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import AsyncIterator, Optional
+
+from sqlalchemy import select, text, update
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+import config
+from logger import get_logger
+from models import Complaint, ComplaintStatus, CLAIMABLE_STATUSES
+
+log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Engine construction
+# ---------------------------------------------------------------------------
+
+_engine: Optional[AsyncEngine] = None
+_sessionmaker: Optional[async_sessionmaker[AsyncSession]] = None
+
+
+async def _build_engine_cloud_sql() -> AsyncEngine:
+    """Build an engine that uses the Cloud SQL Python Connector."""
+    from google.cloud.sql.connector import Connector, IPTypes  # type: ignore[import-not-found]
+
+    connector = Connector()
+
+    async def getconn():
+        # IAM auth — relies on the Cloud Run service account having
+        # roles/cloudsql.client + roles/cloudsql.instanceUser.
+        conn = await connector.connect_async(
+            config.INSTANCE_CONNECTION_NAME,
+            "asyncpg",
+            user=config.DB_USER,
+            db=config.DB_NAME,
+            password=config.DB_PASSWORD,
+            ip_type=IPTypes.PRIVATE,
+        )
+        return conn
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://",
+        async_creator=getconn,
+        pool_size=config.DB_POOL_SIZE,
+        max_overflow=config.DB_MAX_OVERFLOW,
+        pool_pre_ping=True,
+    )
+    log.info(
+        "DB engine ready (Cloud SQL) | instance=%s db=%s pool=%d+%d",
+        config.INSTANCE_CONNECTION_NAME, config.DB_NAME,
+        config.DB_POOL_SIZE, config.DB_MAX_OVERFLOW,
+    )
+    return engine
+
+
+def _build_engine_local() -> AsyncEngine:
+    """Build an engine for local dev — plain asyncpg DSN."""
+    dsn = (
+        f"postgresql+asyncpg://{config.DB_USER}:{config.DB_PASSWORD}"
+        f"@{config.DB_HOST}:{config.DB_PORT}/{config.DB_NAME}"
+    )
+    engine = create_async_engine(
+        dsn,
+        pool_size=config.DB_POOL_SIZE,
+        max_overflow=config.DB_MAX_OVERFLOW,
+        pool_pre_ping=True,
+    )
+    log.info(
+        "DB engine ready (local) | host=%s:%d db=%s pool=%d+%d",
+        config.DB_HOST, config.DB_PORT, config.DB_NAME,
+        config.DB_POOL_SIZE, config.DB_MAX_OVERFLOW,
+    )
+    return engine
+
+
+async def init_db() -> None:
+    """Build engine + sessionmaker once at startup."""
+    global _engine, _sessionmaker
+    if _engine is not None:
+        return
+
+    if config.INSTANCE_CONNECTION_NAME:
+        _engine = await _build_engine_cloud_sql()
+    else:
+        _engine = _build_engine_local()
+
+    _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
+
+    # Sanity check
+    async with _engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    log.info("DB connectivity verified")
+
+
+async def close_db() -> None:
+    global _engine, _sessionmaker
+    if _engine is not None:
+        await _engine.dispose()
+        _engine = None
+        _sessionmaker = None
+        log.info("DB engine disposed")
+
+
+def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    if _sessionmaker is None:
+        raise RuntimeError("DB not initialised — call init_db() first")
+    return _sessionmaker
+
+
+@asynccontextmanager
+async def session_scope() -> AsyncIterator[AsyncSession]:
+    """Open a session that commits on success and rolls back on error."""
+    sm = get_sessionmaker()
+    async with sm() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Claim helper — the heart of safe concurrent sweeping
+# ---------------------------------------------------------------------------
+
+async def claim_pending_complaints(
+    session: AsyncSession,
+    *,
+    batch_size: int,
+    max_attempts: int,
+) -> list[int]:
+    """Atomically claim up to `batch_size` complaints.
+
+    Uses SELECT ... FOR UPDATE SKIP LOCKED so two sweeps never grab the same
+    row. Each claimed row is bumped to PROCESSING + locked_at = now() before
+    the transaction commits, so any concurrent reader sees the lock.
+
+    Returns the list of complaint IDs claimed.
+    """
+    now = datetime.now(timezone.utc)
+
+    stmt = (
+        select(Complaint.id)
+        .where(Complaint.status.in_(CLAIMABLE_STATUSES))
+        .where(Complaint.attempt_count < max_attempts)
+        .order_by(Complaint.created_at.asc())
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+    )
+    result = await session.execute(stmt)
+    ids = [row[0] for row in result.all()]
+
+    if not ids:
+        return []
+
+    await session.execute(
+        update(Complaint)
+        .where(Complaint.id.in_(ids))
+        .values(
+            status=ComplaintStatus.PROCESSING,
+            locked_at=now,
+            updated_at=now,
+            attempt_count=Complaint.attempt_count + 1,
+        )
+    )
+
+    log.info("Claimed %d complaint(s): %s", len(ids), ids)
+    return ids

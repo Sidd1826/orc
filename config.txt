@@ -1,0 +1,116 @@
+
+from __future__ import annotations
+
+import os
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    return int(raw) if raw else default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    return float(raw) if raw else default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+# ---------------------------------------------------------------------------
+# Secret Manager — only runs on GCP (when GOOGLE_CLOUD_PROJECT is set).
+# ---------------------------------------------------------------------------
+
+def _load_secrets_from_gcp() -> None:
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+    if not project_id:
+        return
+
+    try:
+        from google.cloud import secretmanager
+    except ImportError:
+        raise RuntimeError(
+            "google-cloud-secret-manager is not installed. "
+            "Run: pip install google-cloud-secret-manager"
+        )
+
+    client = secretmanager.SecretManagerServiceClient()
+
+    secrets_to_load = {
+        "DB_PASSWORD": "FRAUD_WORKER_DB_PASSWORD",
+    }
+
+    for env_var, secret_name in secrets_to_load.items():
+        if os.environ.get(env_var):
+            continue
+        try:
+            secret_path = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+            response = client.access_secret_version(request={"name": secret_path})
+            os.environ[env_var] = response.payload.data.decode("utf-8").strip()
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load secret '{secret_name}' from Secret Manager: {e}"
+            ) from e
+
+
+_load_secrets_from_gcp()
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+LOG_LEVEL: str = _env("LOG_LEVEL", "INFO")
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+DB_USER:     str = _env("DB_USER",     "fraud")
+DB_PASSWORD: str = _env("DB_PASSWORD", "")
+DB_NAME:     str = _env("DB_NAME",     "fraud")
+DB_HOST:     str = _env("DB_HOST",     "")
+DB_PORT:     int = _env_int("DB_PORT", 5432)
+
+# Set on Cloud Run; empty locally.
+INSTANCE_CONNECTION_NAME: str = _env("INSTANCE_CONNECTION_NAME", "")
+
+DB_POOL_SIZE:    int = _env_int("DB_POOL_SIZE", 5)
+DB_MAX_OVERFLOW: int = _env_int("DB_MAX_OVERFLOW", 5)
+
+
+# ---------------------------------------------------------------------------
+# Gateway (sibling Cloud Run)
+# ---------------------------------------------------------------------------
+
+GATEWAY_BASE_URL:     str  = _env("GATEWAY_BASE_URL", "")
+GATEWAY_USE_IAM_AUTH: bool = _env_bool("GATEWAY_USE_IAM_AUTH", True)
+
+HTTP_CONNECT_TIMEOUT: float = _env_float("HTTP_CONNECT_TIMEOUT", 10.0)
+HTTP_READ_TIMEOUT:    float = _env_float("HTTP_READ_TIMEOUT",    60.0)
+
+
+# ---------------------------------------------------------------------------
+# Worker behaviour
+# ---------------------------------------------------------------------------
+
+SWEEP_BATCH_SIZE:  int   = _env_int("SWEEP_BATCH_SIZE", 20)
+MAX_ATTEMPTS:      int   = _env_int("MAX_ATTEMPTS", 5)
+FRESH_WINDOW_HOURS: int  = _env_int("FRESH_WINDOW_HOURS", 24)
+TRACE_MAX_ROWS:    int   = _env_int("TRACE_MAX_ROWS", 500)
+HOLD_EXPIRY_DATE:  str   = _env("HOLD_EXPIRY_DATE", "2099-12-31")

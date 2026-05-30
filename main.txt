@@ -1,0 +1,240 @@
+"""
+main.py — FastAPI worker. Polls Postgres for pending complaints and runs
+the orchestrator state machine on each.
+
+Routes
+  GET  /healthz
+  POST /internal/sweep                  (Cloud Scheduler hits this every minute)
+  POST /internal/process/{complaint_id} (manual reprocess — ops tool)
+
+Run locally:
+  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy import update
+
+import config
+import db as dbmod
+from gateway_client import GatewayClient
+from logger import get_logger
+from models import Complaint, ComplaintStatus
+from orchestrator import (
+    OrchestratorError,
+    PendingHoldError,
+    process_complaint,
+)
+
+log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("=== Starting fraud worker ===")
+    log.info("Gateway: %s (iam_auth=%s)",
+             config.GATEWAY_BASE_URL, config.GATEWAY_USE_IAM_AUTH)
+    log.info("Sweep: batch_size=%d max_attempts=%d fresh_window=%dh",
+             config.SWEEP_BATCH_SIZE, config.MAX_ATTEMPTS, config.FRESH_WINDOW_HOURS)
+
+    await dbmod.init_db()
+
+    http = httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            connect=config.HTTP_CONNECT_TIMEOUT,
+            read=config.HTTP_READ_TIMEOUT,
+            write=config.HTTP_READ_TIMEOUT,
+            pool=config.HTTP_CONNECT_TIMEOUT,
+        ),
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+    )
+    app.state.http    = http
+    app.state.gateway = GatewayClient(http=http)
+
+    log.info("=== Worker ready ===")
+    try:
+        yield
+    finally:
+        await http.aclose()
+        await dbmod.close_db()
+        log.info("=== Worker shut down ===")
+
+
+app = FastAPI(title="Fraud Worker", version="1.0.0", lifespan=lifespan, docs_url="/docs")
+
+
+@app.exception_handler(Exception)
+async def _unhandled(_req: Request, exc: Exception):
+    log.exception("Unhandled: %s", exc)
+    return JSONResponse(
+        {"error": "internal_error", "message": "An unexpected error occurred"},
+        status_code=500,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+@app.get("/healthz", tags=["Health"])
+async def healthz():
+    return {"status": "ok", "service": "fraud-worker"}
+
+
+# ---------------------------------------------------------------------------
+# Sweep — the scheduled trigger
+# ---------------------------------------------------------------------------
+
+@app.post("/internal/sweep", tags=["Internal"])
+async def sweep(request: Request) -> dict[str, Any]:
+    """Claim a batch of pending complaints and process each one.
+
+    A single tick processes up to SWEEP_BATCH_SIZE complaints sequentially.
+    For 100 complaints/day @ 60s cadence that's ~1 per tick on average, so
+    we never get behind. If we ever do, raise SWEEP_BATCH_SIZE.
+    """
+    gateway: GatewayClient = request.app.state.gateway
+
+    # Claim a batch in its own short transaction so other sweepers see the
+    # locks even before we finish processing.
+    async with dbmod.session_scope() as session:
+        complaint_ids = await dbmod.claim_pending_complaints(
+            session,
+            batch_size  = config.SWEEP_BATCH_SIZE,
+            max_attempts= config.MAX_ATTEMPTS,
+        )
+
+    if not complaint_ids:
+        return {"claimed": 0, "processed": 0, "results": []}
+
+    results: list[dict[str, Any]] = []
+    for cid in complaint_ids:
+        result = await _process_one(cid, gateway)
+        results.append(result)
+
+    processed = sum(1 for r in results if r["outcome"] == "ok")
+    return {"claimed": len(complaint_ids), "processed": processed, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Manual reprocess — ops tool, mostly for failed_terminal recovery after
+# investigation.
+# ---------------------------------------------------------------------------
+
+@app.post("/internal/process/{complaint_id}", tags=["Internal"])
+async def manual_process(complaint_id: int, request: Request) -> dict[str, Any]:
+    gateway: GatewayClient = request.app.state.gateway
+
+    # Force the complaint back into PROCESSING regardless of current status
+    # (ops is explicitly opting in to the rerun).
+    now = datetime.now(timezone.utc)
+    async with dbmod.session_scope() as session:
+        res = await session.execute(
+            update(Complaint)
+            .where(Complaint.id == complaint_id)
+            .values(status=ComplaintStatus.PROCESSING, locked_at=now, updated_at=now)
+            .returning(Complaint.id)
+        )
+        if res.scalar_one_or_none() is None:
+            raise HTTPException(status_code=404, detail=f"Complaint {complaint_id} not found")
+
+    return await _process_one(complaint_id, gateway)
+
+
+# ---------------------------------------------------------------------------
+# Shared per-complaint executor — runs the state machine inside its own
+# session, handles every failure path, and updates terminal state.
+# ---------------------------------------------------------------------------
+
+async def _process_one(complaint_id: int, gateway: GatewayClient) -> dict[str, Any]:
+    log.info("--- process complaint %d ---", complaint_id)
+    try:
+        async with dbmod.session_scope() as session:
+            await process_complaint(
+                session=session, gateway=gateway, complaint_id=complaint_id,
+            )
+        return {"complaintId": complaint_id, "outcome": "ok"}
+
+    except PendingHoldError as e:
+        log.error("Complaint %d: %s", complaint_id, e)
+        await _mark(complaint_id, ComplaintStatus.MANUAL_REVIEW, str(e))
+        return {"complaintId": complaint_id, "outcome": "manual_review", "reason": str(e)}
+
+    except OrchestratorError as e:
+        log.error("Complaint %d orchestrator error (terminal=%s): %s",
+                  complaint_id, e.terminal, e)
+        target = ComplaintStatus.FAILED_TERMINAL if e.terminal else ComplaintStatus.FAILED_RETRYABLE
+        await _mark(complaint_id, target, str(e))
+        return {"complaintId": complaint_id, "outcome": target.lower(), "reason": str(e)}
+
+    except Exception as e:
+        # Anything else — retry on next sweep, but escalate after MAX_ATTEMPTS.
+        log.exception("Complaint %d unexpected failure", complaint_id)
+        await _mark_failure_with_attempt_check(complaint_id, str(e))
+        return {"complaintId": complaint_id, "outcome": "failed", "reason": str(e)}
+
+
+async def _mark(complaint_id: int, status: str, error: str) -> None:
+    """Set status + last_error in a fresh transaction (the previous one may
+    have rolled back)."""
+    now = datetime.now(timezone.utc)
+    async with dbmod.session_scope() as session:
+        await session.execute(
+            update(Complaint)
+            .where(Complaint.id == complaint_id)
+            .values(status=status, last_error=error[:2000], updated_at=now)
+        )
+
+
+async def _mark_failure_with_attempt_check(complaint_id: int, error: str) -> None:
+    """Choose retryable vs terminal based on attempt_count."""
+    async with dbmod.session_scope() as session:
+        res = await session.execute(
+            update(Complaint)
+            .where(Complaint.id == complaint_id)
+            .where(Complaint.attempt_count >= config.MAX_ATTEMPTS)
+            .values(
+                status     = ComplaintStatus.FAILED_TERMINAL,
+                last_error = error[:2000],
+                updated_at = datetime.now(timezone.utc),
+            )
+            .returning(Complaint.id)
+        )
+        if res.scalar_one_or_none() is not None:
+            return
+
+        await session.execute(
+            update(Complaint)
+            .where(Complaint.id == complaint_id)
+            .values(
+                status     = ComplaintStatus.FAILED_RETRYABLE,
+                last_error = error[:2000],
+                updated_at = datetime.now(timezone.utc),
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=False,
+    )

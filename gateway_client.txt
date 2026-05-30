@@ -1,0 +1,245 @@
+"""
+gateway_client.py — Typed async client for the sibling HSBC MHA Gateway.
+
+Wraps the four endpoints we need from the gateway:
+
+  * GET  /api/v1/transactions/history
+  * POST /api/v1/accounts/apply-hold
+  * GET  /api/v1/accounts/demand-deposit
+  * POST /api/v1/search                  (BigQuery filtered search)
+
+Auth: Cloud-Run-to-Cloud-Run identity tokens via google-auth. The ID token is
+fetched once per call (the underlying library caches/refreshes for us). The
+audience must be the gateway's root URL. Toggle off via GATEWAY_USE_IAM_AUTH
+for local dev / unauthenticated UAT.
+
+verify=True — gateway uses standard public Cloud Run TLS.
+"""
+from __future__ import annotations
+
+import json
+from typing import Any, Optional
+
+import httpx
+
+import config
+from logger import get_logger
+
+log = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+class GatewayError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 502,
+        upstream_status: Optional[int] = None,
+        upstream_body: Any = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.upstream_status = upstream_status
+        self.upstream_body = upstream_body
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+class GatewayClient:
+    """Async wrapper around the gateway service."""
+
+    def __init__(self, http: httpx.AsyncClient) -> None:
+        if not config.GATEWAY_BASE_URL:
+            raise RuntimeError("GATEWAY_BASE_URL is not set")
+        self._http = http
+        self._base = config.GATEWAY_BASE_URL.rstrip("/")
+        self._use_iam = config.GATEWAY_USE_IAM_AUTH
+        log.info(
+            "GatewayClient ready | base=%s iam_auth=%s",
+            self._base, self._use_iam,
+        )
+
+    # ------------------------------------------------------------------
+    # Auth
+    # ------------------------------------------------------------------
+
+    def _get_id_token(self) -> Optional[str]:
+        """Fetch an ID token for Cloud Run service-to-service auth."""
+        if not self._use_iam:
+            return None
+        # Imported lazily so local dev without google-auth still works.
+        import google.auth.transport.requests
+        import google.oauth2.id_token
+
+        auth_req = google.auth.transport.requests.Request()
+        token = google.oauth2.id_token.fetch_id_token(auth_req, self._base)
+        return token
+
+    def _auth_headers(self) -> dict[str, str]:
+        token = self._get_id_token()
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
+    # ------------------------------------------------------------------
+    # Core dispatch
+    # ------------------------------------------------------------------
+
+    async def _do(
+        self,
+        *,
+        method: str,
+        path: str,
+        op: str,
+        params:    Optional[dict[str, Any]] = None,
+        json_body: Optional[dict[str, Any]] = None,
+        content:   Optional[bytes]          = None,
+        headers:   Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        url = f"{self._base}{path}"
+        hdrs = {"Accept": "application/json", **self._auth_headers()}
+        if json_body is not None or content is not None:
+            hdrs["Content-Type"] = "application/json"
+        if headers:
+            hdrs.update(headers)
+
+        log.info("Gateway -> %s %s (op=%s)", method, path, op)
+        try:
+            resp = await self._http.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json_body if content is None else None,
+                content=content,
+                headers=hdrs,
+            )
+        except httpx.HTTPError as e:
+            log.error("Gateway %s network error: %s", op, e)
+            raise GatewayError(
+                f"Gateway network error: {type(e).__name__}",
+                status_code=502,
+            ) from e
+
+        log.info("Gateway <- %s status=%d", op, resp.status_code)
+
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text}
+
+        if resp.status_code >= 400:
+            log.error("Gateway %s error body: %s", op, resp.text[:2000])
+            raise GatewayError(
+                f"Gateway {op} returned {resp.status_code}",
+                status_code=resp.status_code,
+                upstream_status=resp.status_code,
+                upstream_body=data,
+            )
+        return data
+
+    # ------------------------------------------------------------------
+    # Endpoint #1 — Transaction history (GET, body = sensitiveData)
+    #
+    # The gateway accepts a JSON body alongside the GET query string. httpx
+    # supports this via the `content` argument.
+    # ------------------------------------------------------------------
+
+    async def get_transaction_history(
+        self,
+        *,
+        account_number_token: str,
+        real_account_number:  str,
+        from_date: Optional[str] = None,
+        to_date:   Optional[str] = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"accountNumber": account_number_token}
+        if from_date:
+            params["fromDate"] = from_date
+        if to_date:
+            params["toDate"] = to_date
+
+        body = {"sensitiveData": [
+            {"key": account_number_token, "value": real_account_number},
+        ]}
+        return await self._do(
+            method="GET",
+            path="/api/v1/transactions/history",
+            op="transaction_history",
+            params=params,
+            content=json.dumps(body).encode("utf-8"),
+        )
+
+    # ------------------------------------------------------------------
+    # Endpoint #2 — Apply account hold (POST)
+    # ------------------------------------------------------------------
+
+    async def apply_account_hold(
+        self,
+        *,
+        account_number:        str,
+        account_currency_code: str,
+        hold_amount:           str,        # decimal string, e.g. "28.28"
+        hold_currency:         str,
+        hold_till_expired_date: str,       # YYYY-MM-DD
+        hold_type:             str = "B",
+    ) -> dict[str, Any]:
+        body = {
+            "applyHoldDetails": {
+                "accountNumber":        account_number,
+                "accountCurrencyCode":  account_currency_code,
+                "holdTillExpiredDate":  hold_till_expired_date,
+                "holdType":             hold_type,
+                "holdCurrency":         hold_currency,
+                "holdAmount":           hold_amount,
+            }
+        }
+        return await self._do(
+            method="POST",
+            path="/api/v1/accounts/apply-hold",
+            op="apply_hold",
+            json_body=body,
+        )
+
+    # ------------------------------------------------------------------
+    # Endpoint #3 — Demand deposit account enquiry (GET + sensitiveData body)
+    # ------------------------------------------------------------------
+
+    async def get_demand_deposit_account(
+        self,
+        *,
+        hub_customer_token: str,
+        real_account_number: str,
+    ) -> dict[str, Any]:
+        params = {"hubCustomerNumber": hub_customer_token}
+        body = {"sensitiveData": [
+            {"key": hub_customer_token, "value": real_account_number},
+        ]}
+        return await self._do(
+            method="GET",
+            path="/api/v1/accounts/demand-deposit",
+            op="demand_deposit",
+            params=params,
+            content=json.dumps(body).encode("utf-8"),
+        )
+
+    # ------------------------------------------------------------------
+    # Endpoint #4 — BigQuery filtered search (POST)
+    # ------------------------------------------------------------------
+
+    async def search_bigquery(
+        self,
+        *,
+        filters: dict[str, Any],
+        limit:   int = 100,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {**filters, "limit": limit}
+        return await self._do(
+            method="POST",
+            path="/api/v1/search",
+            op="bq_search",
+            json_body=body,
+        )
