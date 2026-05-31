@@ -1,4 +1,13 @@
+"""
+config.py — Central config.
 
+On Cloud Run: secrets are pulled from GCP Secret Manager at startup,
+              Cloud SQL uses the Cloud SQL Python Connector + ADC.
+Locally:      values are loaded from .env via python-dotenv.
+
+Secret Manager is only contacted when GOOGLE_CLOUD_PROJECT is set (i.e. on
+GCP). Locally it falls back to .env / os.environ — no GCP credentials needed.
+"""
 from __future__ import annotations
 
 import os
@@ -50,8 +59,11 @@ def _load_secrets_from_gcp() -> None:
 
     client = secretmanager.SecretManagerServiceClient()
 
-    secrets_to_load = {
-        "DB_PASSWORD": "FRAUD_WORKER_DB_PASSWORD",
+    # IAM DB auth means we don't need a DB password on GCP — the Cloud SQL
+    # Python Connector authenticates as the service account. Keep this dict
+    # for any future secrets the worker needs.
+    secrets_to_load: dict[str, str] = {
+        # "EXAMPLE_SECRET": "FRAUD_WORKER_EXAMPLE_SECRET",
     }
 
     for env_var, secret_name in secrets_to_load.items():

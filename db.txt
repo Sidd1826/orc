@@ -3,20 +3,28 @@ db.py — Async SQLAlchemy engine + session factory + claim helper.
 
 Two connection modes:
 
-  * Local / VM:  plain asyncpg DSN built from DB_HOST/DB_PORT/etc.
-  * Cloud Run:   cloud-sql-python-connector with IAM auth (ADC). Triggered
-                 by INSTANCE_CONNECTION_NAME being set.
+  * Cloud Run: Cloud SQL Python Connector with pg8000 driver + IAM auth.
+               Same pattern as the rest of our GCP services. Triggered by
+               INSTANCE_CONNECTION_NAME being set.
+  * Local:    Plain pg8000 DSN built from DB_HOST/DB_PORT/etc.
+
+We use pg8000 (pure-Python Postgres driver) because the Cloud SQL Python
+Connector supports it natively with IAM auth via `enable_iam_auth=True`.
+pg8000 is synchronous, so we wrap it with SQLAlchemy's standard sync engine
+inside async runners. SQLAlchemy handles thread-pool offloading transparently
+via `AsyncEngine` over a sync driver — no asyncpg needed.
 
 The claim helper uses `SELECT ... FOR UPDATE SKIP LOCKED` so two sweep
 instances can safely run concurrently without ever grabbing the same row.
 """
 from __future__ import annotations
 
-import asyncio
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
+import sqlalchemy
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -27,71 +35,99 @@ from sqlalchemy.ext.asyncio import (
 
 import config
 from logger import get_logger
-from models import Complaint, ComplaintStatus, CLAIMABLE_STATUSES
+from models import CLAIMABLE_STATUSES, Complaint, ComplaintStatus
 
 log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Engine construction
+# Connection pool builders
 # ---------------------------------------------------------------------------
 
-_engine: Optional[AsyncEngine] = None
-_sessionmaker: Optional[async_sessionmaker[AsyncSession]] = None
+def _create_conn_pool_cloud_sql() -> AsyncEngine:
+    """Build an async engine that uses the Cloud SQL Python Connector + pg8000.
 
-
-async def _build_engine_cloud_sql() -> AsyncEngine:
-    """Build an engine that uses the Cloud SQL Python Connector."""
+    Mirrors the team-standard `_create_conn_pool` pattern:
+      - pg8000 driver
+      - enable_iam_auth=True (no password needed; ADC handles it)
+      - PRIVATE/PUBLIC IP toggle via env
+    """
     from google.cloud.sql.connector import Connector, IPTypes  # type: ignore[import-not-found]
+
+    instance_connection_name = config.INSTANCE_CONNECTION_NAME
+    log.info("instance connection name: %s", instance_connection_name)
+
+    ip_type = (
+        IPTypes.PRIVATE
+        if os.getenv("PRIVATE_IP", "false").lower() == "true"
+        else IPTypes.PUBLIC
+    )
 
     connector = Connector()
 
-    async def getconn():
-        # IAM auth — relies on the Cloud Run service account having
-        # roles/cloudsql.client + roles/cloudsql.instanceUser.
-        conn = await connector.connect_async(
-            config.INSTANCE_CONNECTION_NAME,
-            "asyncpg",
+    def getconn():
+        conn = connector.connect(
+            instance_connection_name,
+            "pg8000",
             user=config.DB_USER,
             db=config.DB_NAME,
-            password=config.DB_PASSWORD,
-            ip_type=IPTypes.PRIVATE,
+            enable_iam_auth=True,
+            ip_type=ip_type,
         )
         return conn
 
+    # The Cloud SQL Python Connector is used with SQLAlchemy via the
+    # `creator` argument. We wrap with create_async_engine so the rest of
+    # the app can keep using `async with session_scope()`. SQLAlchemy
+    # automatically offloads sync pg8000 calls to a thread pool.
     engine = create_async_engine(
-        "postgresql+asyncpg://",
-        async_creator=getconn,
+        "postgresql+pg8000://",
+        creator=getconn,
+        # Pool size — maximum number of permanent connections.
         pool_size=config.DB_POOL_SIZE,
+        # Temporarily exceeds the set pool size if no connections are available.
         max_overflow=config.DB_MAX_OVERFLOW,
+        # Pool timeout in seconds.
+        pool_timeout=30,
+        # Maximum number of seconds a connection persists; reestablished after.
+        pool_recycle=1800,
         pool_pre_ping=True,
     )
     log.info(
-        "DB engine ready (Cloud SQL) | instance=%s db=%s pool=%d+%d",
-        config.INSTANCE_CONNECTION_NAME, config.DB_NAME,
-        config.DB_POOL_SIZE, config.DB_MAX_OVERFLOW,
+        "DB engine ready (Cloud SQL via pg8000 + IAM) | ip_type=%s pool=%d+%d",
+        ip_type.name, config.DB_POOL_SIZE, config.DB_MAX_OVERFLOW,
     )
     return engine
 
 
-def _build_engine_local() -> AsyncEngine:
-    """Build an engine for local dev — plain asyncpg DSN."""
+def _create_conn_pool_local() -> AsyncEngine:
+    """Build an engine for local dev — plain pg8000 DSN with password."""
     dsn = (
-        f"postgresql+asyncpg://{config.DB_USER}:{config.DB_PASSWORD}"
+        f"postgresql+pg8000://{config.DB_USER}:{config.DB_PASSWORD}"
         f"@{config.DB_HOST}:{config.DB_PORT}/{config.DB_NAME}"
     )
     engine = create_async_engine(
         dsn,
         pool_size=config.DB_POOL_SIZE,
         max_overflow=config.DB_MAX_OVERFLOW,
+        pool_timeout=30,
+        pool_recycle=1800,
         pool_pre_ping=True,
     )
     log.info(
-        "DB engine ready (local) | host=%s:%d db=%s pool=%d+%d",
+        "DB engine ready (local pg8000) | host=%s:%d db=%s pool=%d+%d",
         config.DB_HOST, config.DB_PORT, config.DB_NAME,
         config.DB_POOL_SIZE, config.DB_MAX_OVERFLOW,
     )
     return engine
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+
+_engine: Optional[AsyncEngine] = None
+_sessionmaker: Optional[async_sessionmaker[AsyncSession]] = None
 
 
 async def init_db() -> None:
@@ -101,9 +137,9 @@ async def init_db() -> None:
         return
 
     if config.INSTANCE_CONNECTION_NAME:
-        _engine = await _build_engine_cloud_sql()
+        _engine = _create_conn_pool_cloud_sql()
     else:
-        _engine = _build_engine_local()
+        _engine = _create_conn_pool_local()
 
     _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
 
