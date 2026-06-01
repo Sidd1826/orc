@@ -14,7 +14,6 @@ from typing import Any, Optional
 
 from sqlalchemy import (
     BigInteger,
-    Boolean,
     Date,
     DateTime,
     ForeignKey,
@@ -136,7 +135,13 @@ class Incident(Base):
 
     transaction_date:   Mapped[date]     = mapped_column(Date, nullable=False)
     transaction_time:   Mapped[time]     = mapped_column(Time, nullable=False)
-    transaction_at:     Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # transaction_at is a Postgres GENERATED column:
+    #   (transaction_date + transaction_time) AT TIME ZONE 'Asia/Kolkata'
+    # We mark it read-only with server_default + don't write to it.
+    transaction_at:     Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        server_default=None,
+    )
 
     created_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -155,11 +160,13 @@ class ApiResponseLog(Base):
     response_code:       Mapped[str]                = mapped_column(String(10), nullable=False)
     response_message:    Mapped[str]                = mapped_column(String, nullable=False, default=ApiResponseStatus.SUCCESS)
     response_payload:    Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
-    is_success:          Mapped[bool]               = mapped_column(Boolean, nullable=False)
+    # NOTE: is_success is a Postgres GENERATED column (response_code = '00'),
+    # so we don't map it for writes. The orchestrator sets response_code='00'
+    # on success and a non-'00' string on failure.
 
     requested_at:        Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False)
     responded_at:        Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    response_latency_ms: Mapped[Optional[int]]      = mapped_column(Integer, nullable=True)
+    # response_latency_ms is also a GENERATED column — don't map it.
 
     created_at:          Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at:          Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False)
