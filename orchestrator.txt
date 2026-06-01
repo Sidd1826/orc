@@ -1,237 +1,605 @@
 """
-gateway_client.py — Sync httpx client for the sibling HSBC MHA Gateway.
+orchestrator.py — Per-complaint state machine (sync).
 
-Wraps the four endpoints we need:
+Every external side-effect is logged to `api_response_logs` with a
+deterministic job_id, and the database itself prevents two successful holds
+on the same complaint (unique partial index from migration.sql).
 
-  * GET  /api/v1/transactions/history
-  * POST /api/v1/accounts/apply-hold
-  * GET  /api/v1/accounts/demand-deposit
-  * POST /api/v1/search                  (BigQuery filtered search)
+Idempotency strategy
+====================
+For each downstream call the orchestrator follows the same pattern:
 
-Auth: Cloud-Run-to-Cloud-Run identity tokens via google-auth (toggleable).
-Sync because pg8000 is sync; main.py offloads everything to a thread pool.
+  1. Check api_response_logs for an existing row with this complaint's
+     job_id. If response_code='00' (success) — short-circuit, reuse payload.
+  2. Otherwise INSERT a PENDING marker row (response_code='PEND'). The
+     deterministic job_id makes this safe to retry.
+  3. Make the call.
+  4. UPDATE the row with the final response_code:
+       - '00'  on success         (Postgres marks is_success=true)
+       - error code on failure    (is_success=false)
+
+If the worker crashes between step 3 and 4 for the apply_hold call, the
+next attempt sees a 'PEND' row and routes the complaint to MANUAL_REVIEW —
+we *never* speculatively re-call apply_hold, because that risks a double
+hold on a customer account.
 """
 from __future__ import annotations
 
-import json
+import hashlib
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
-import httpx
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session, selectinload
 
 import config
+from gateway_client import GatewayClient, GatewayError
 from logger import get_logger
+from models import (
+    ApiResponseLog,
+    ApiResponseStatus,
+    Complaint,
+    ComplaintResponse,
+    ComplaintStatus,
+    Incident,
+    Instrument,
+)
+from response_builder import build_final_response
 
 log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Errors
+# Response-code constants — match the schema's "00 = success" contract.
 # ---------------------------------------------------------------------------
 
-class GatewayError(Exception):
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int = 502,
-        upstream_status: Optional[int] = None,
-        upstream_body: Any = None,
-    ):
+CODE_SUCCESS = "00"     # Postgres-generated is_success flips to true
+CODE_PENDING = "PEND"   # Marker for a call that's been started but not yet finalised
+
+
+# ---------------------------------------------------------------------------
+# BQ field mappings (see bq_client.py in the gateway)
+# ---------------------------------------------------------------------------
+
+BQ_FIELD_BENEFICIARY_ACCOUNT = "OGBEAC"   # Beneficiary A/C No
+BQ_FIELD_TRANSACTION_REF     = "OGTRNO"   # Transaction Reference No
+BQ_FIELD_AMOUNT              = "OGPYAM"   # Payment Amount
+BQ_FIELD_CURRENCY            = "OGPYCY"   # Payment Currency
+BQ_FIELD_CAPTURE_DATE        = "OGCPDT"   # Capture Date (INT64, e.g. 20260926)
+
+DEFAULT_CURRENCY = "INR"
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator errors
+# ---------------------------------------------------------------------------
+
+class OrchestratorError(Exception):
+    """Generic orchestrator failure — retryable unless `terminal=True`."""
+
+    def __init__(self, message: str, *, terminal: bool = False):
         super().__init__(message)
-        self.status_code = status_code
-        self.upstream_status = upstream_status
-        self.upstream_body = upstream_body
+        self.terminal = terminal
+
+
+class PendingHoldError(OrchestratorError):
+    """Found a PENDING apply_hold row — needs human verification."""
+
+    def __init__(self):
+        super().__init__(
+            "Found a PENDING apply_hold row from a previous attempt — "
+            "manual verification required",
+            terminal=True,
+        )
 
 
 # ---------------------------------------------------------------------------
-# Client
+# job_id helpers — deterministic, so retries always reuse the same row
 # ---------------------------------------------------------------------------
 
-class GatewayClient:
-    """Sync wrapper around the gateway service."""
+def _job_id(op: str, complaint: Complaint, *parts: str) -> str:
+    """Build a deterministic job_id for a logical call attempt.
 
-    def __init__(self, http: httpx.Client) -> None:
-        if not config.GATEWAY_BASE_URL:
-            raise RuntimeError("GATEWAY_BASE_URL is not set")
-        self._http = http
-        self._base = config.GATEWAY_BASE_URL.rstrip("/")
-        self._use_iam = config.GATEWAY_USE_IAM_AUTH
-        log.info(
-            "GatewayClient ready | base=%s iam_auth=%s",
-            self._base, self._use_iam,
+    Length cap: api_response_logs.job_id is VARCHAR(60).
+    """
+    tail = ":".join(parts)
+    suffix = f":{tail}" if tail else ""
+    base = f"{op}:{complaint.acknowledgement_no}{suffix}"
+    if len(base) > 60:
+        h = hashlib.sha1(base.encode()).hexdigest()[:10]
+        base = base[:49] + ":" + h
+    return base
+
+
+# ---------------------------------------------------------------------------
+# api_response_logs helpers
+# ---------------------------------------------------------------------------
+
+def _find_log(
+    session: Session, complaint_id: int, job_id: str
+) -> Optional[ApiResponseLog]:
+    res = session.execute(
+        select(ApiResponseLog).where(
+            ApiResponseLog.complaint_id == complaint_id,
+            ApiResponseLog.job_id == job_id,
         )
+    )
+    return res.scalar_one_or_none()
 
-    # ------------------------------------------------------------------
-    # Auth
-    # ------------------------------------------------------------------
 
-    def _get_id_token(self) -> Optional[str]:
-        """Fetch an ID token for Cloud Run service-to-service auth."""
-        if not self._use_iam:
-            return None
-        import google.auth.transport.requests
-        import google.oauth2.id_token
+def _insert_pending_log(
+    session: Session,
+    *,
+    complaint: Complaint,
+    job_id: str,
+) -> ApiResponseLog:
+    now = datetime.now(timezone.utc)
+    row = ApiResponseLog(
+        complaint_id       = complaint.id,
+        acknowledgement_no = complaint.acknowledgement_no,
+        job_id             = job_id,
+        response_code      = CODE_PENDING,
+        response_message   = ApiResponseStatus.PENDING,
+        response_payload   = None,
+        requested_at       = now,
+        created_at         = now,
+        updated_at         = now,
+    )
+    session.add(row)
+    session.flush()
+    return row
 
-        auth_req = google.auth.transport.requests.Request()
-        token = google.oauth2.id_token.fetch_id_token(auth_req, self._base)
-        return token
 
-    def _auth_headers(self) -> dict[str, str]:
-        token = self._get_id_token()
-        return {"Authorization": f"Bearer {token}"} if token else {}
+def _finalise_log(
+    session: Session,
+    log_row: ApiResponseLog,
+    *,
+    success: bool,
+    code: str,
+    payload: Any,
+) -> None:
+    now = datetime.now(timezone.utc)
+    # On success force '00' so the GENERATED is_success column flips to true.
+    log_row.response_code    = CODE_SUCCESS if success else (code[:10] if code else "ERR")
+    log_row.response_message = ApiResponseStatus.SUCCESS if success else ApiResponseStatus.FAILURE
+    log_row.response_payload = payload if isinstance(payload, dict) else {"raw": payload}
+    log_row.responded_at     = now
+    log_row.updated_at       = now
+    session.flush()
 
-    # ------------------------------------------------------------------
-    # Core dispatch
-    # ------------------------------------------------------------------
 
-    def _do(
-        self,
-        *,
-        method: str,
-        path: str,
-        op: str,
-        params:    Optional[dict[str, Any]] = None,
-        json_body: Optional[dict[str, Any]] = None,
-        content:   Optional[bytes]          = None,
-        headers:   Optional[dict[str, str]] = None,
-    ) -> dict[str, Any]:
-        url = f"{self._base}{path}"
-        hdrs = {"Accept": "application/json", **self._auth_headers()}
-        if json_body is not None or content is not None:
-            hdrs["Content-Type"] = "application/json"
-        if headers:
-            hdrs.update(headers)
+# ---------------------------------------------------------------------------
+# Domain helpers
+# ---------------------------------------------------------------------------
 
-        log.info("Gateway -> %s %s (op=%s)", method, path, op)
-        try:
-            resp = self._http.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_body if content is None else None,
-                content=content,
-                headers=hdrs,
-            )
-        except httpx.HTTPError as e:
-            log.error("Gateway %s network error: %s", op, e)
-            raise GatewayError(
-                f"Gateway network error: {type(e).__name__}",
-                status_code=502,
-            ) from e
+def _is_fresh(incident: Incident) -> bool:
+    """Was this transaction within the FRESH_WINDOW_HOURS?"""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=config.FRESH_WINDOW_HOURS)
+    return incident.transaction_at >= cutoff
 
-        log.info("Gateway <- %s status=%d", op, resp.status_code)
 
-        try:
-            data = resp.json()
-        except ValueError:
-            data = {"raw": resp.text}
+def _extract_balance(demand_deposit_payload: dict[str, Any]) -> Optional[Decimal]:
+    """Pull the available balance out of the demand-deposit response.
 
-        if resp.status_code >= 400:
-            log.error("Gateway %s error body: %s", op, resp.text[:2000])
-            raise GatewayError(
-                f"Gateway {op} returned {resp.status_code}",
-                status_code=resp.status_code,
-                upstream_status=resp.status_code,
-                upstream_body=data,
-            )
-        return data
+    The exact JSON path depends on the HSBC Hub response shape, which isn't
+    documented in the gateway code. We try a handful of common locations and
+    return None if nothing matches — caller treats None as MANUAL_REVIEW.
+    """
+    candidates = [
+        ("data", "availableBalance"),
+        ("data", "accountBalance", "availableBalance"),
+        ("availableBalance",),
+        ("response", "availableBalance"),
+    ]
+    for path in candidates:
+        node: Any = demand_deposit_payload
+        ok = True
+        for key in path:
+            if isinstance(node, dict) and key in node:
+                node = node[key]
+            else:
+                ok = False
+                break
+        if ok and node is not None:
+            try:
+                return Decimal(str(node))
+            except Exception:
+                continue
+    return None
 
-    # ------------------------------------------------------------------
-    # Endpoint #1 — Transaction history (GET with body)
-    # ------------------------------------------------------------------
 
-    def get_transaction_history(
-        self,
-        *,
-        account_number_token: str,
-        real_account_number:  str,
-        from_date: Optional[str] = None,
-        to_date:   Optional[str] = None,
-    ) -> dict[str, Any]:
-        params: dict[str, Any] = {"accountNumber": account_number_token}
-        if from_date:
-            params["fromDate"] = from_date
-        if to_date:
-            params["toDate"] = to_date
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
-        body = {"sensitiveData": [
-            {"key": account_number_token, "value": real_account_number},
-        ]}
-        return self._do(
-            method="GET",
-            path="/api/v1/transactions/history",
-            op="transaction_history",
-            params=params,
-            content=json.dumps(body).encode("utf-8"),
+def process_complaint(
+    *,
+    session: Session,
+    gateway: GatewayClient,
+    complaint_id: int,
+) -> None:
+    """Run the full state machine for one complaint."""
+    complaint = _load_complaint(session, complaint_id)
+    if complaint is None:
+        log.warning("Complaint %d disappeared mid-flight", complaint_id)
+        return
+
+    if complaint.status in (ComplaintStatus.RESOLVED, ComplaintStatus.FAILED_TERMINAL):
+        log.info("Complaint %s already in terminal state %s, skipping",
+                 complaint.acknowledgement_no, complaint.status)
+        return
+
+    instrument = complaint.instrument
+    incidents  = list(instrument.incidents)
+    if not incidents:
+        log.warning("Complaint %s has no incidents — routing to MANUAL_REVIEW",
+                    complaint.acknowledgement_no)
+        _set_status(session, complaint, ComplaintStatus.MANUAL_REVIEW,
+                    last_error="No incidents present")
+        return
+
+    log.info("Processing complaint %s | instrument=%s incidents=%d",
+             complaint.acknowledgement_no, instrument.id, len(incidents))
+
+    # 1. Balance enquiry ----------------------------------------------------
+    balance_payload = _step_demand_deposit(session, gateway, complaint, instrument)
+    available_balance = _extract_balance(balance_payload)
+
+    if available_balance is None:
+        log.error("Could not parse balance from demand-deposit response — manual review")
+        _set_status(session, complaint, ComplaintStatus.MANUAL_REVIEW,
+                    last_error="Unable to parse availableBalance")
+        return
+
+    log.info("Complaint %s | available_balance=%s",
+             complaint.acknowledgement_no, available_balance)
+    _set_status(session, complaint, ComplaintStatus.BALANCE_FETCHED)
+
+    # 2. Per-incident transaction enquiry ----------------------------------
+    txn_details: list[dict[str, Any]] = []
+    total_disputed = Decimal("0")
+    for inc in incidents:
+        total_disputed += inc.disputed_amount
+        detail = _step_fetch_transaction_detail(
+            session, gateway, complaint, instrument, inc,
         )
+        txn_details.append(detail)
 
-    # ------------------------------------------------------------------
-    # Endpoint #2 — Apply account hold (POST)
-    # ------------------------------------------------------------------
+    log.info("Complaint %s | total_disputed=%s",
+             complaint.acknowledgement_no, total_disputed)
 
-    def apply_account_hold(
-        self,
-        *,
-        account_number:        str,
-        account_currency_code: str,
-        hold_amount:           str,
-        hold_currency:         str,
-        hold_till_expired_date: str,
-        hold_type:             str = "B",
-    ) -> dict[str, Any]:
-        body = {
-            "applyHoldDetails": {
-                "accountNumber":        account_number,
-                "accountCurrencyCode":  account_currency_code,
-                "holdTillExpiredDate":  hold_till_expired_date,
-                "holdType":             hold_type,
-                "holdCurrency":         hold_currency,
-                "holdAmount":           hold_amount,
-            }
+    # 3. Apply hold ---------------------------------------------------------
+    if available_balance <= 0:
+        hold_outcome = {"status": "NONE", "amount": "0.00", "reason": "Zero balance"}
+        remaining = total_disputed
+    else:
+        hold_amount = min(total_disputed, available_balance)
+        hold_payload = _step_apply_hold(
+            session, gateway, complaint, instrument,
+            hold_amount=hold_amount,
+        )
+        is_full = hold_amount >= total_disputed
+        hold_outcome = {
+            "status":    "FULL" if is_full else "PARTIAL",
+            "amount":    f"{hold_amount:.2f}",
+            "reference": hold_payload.get("requestId") or hold_payload.get("data", {}).get("holdReference"),
         }
-        return self._do(
-            method="POST",
-            path="/api/v1/accounts/apply-hold",
-            op="apply_hold",
-            json_body=body,
+        remaining = total_disputed - hold_amount
+        _set_status(
+            session, complaint,
+            ComplaintStatus.HOLD_APPLIED_FULL if is_full else ComplaintStatus.HOLD_APPLIED_PARTIAL,
         )
 
-    # ------------------------------------------------------------------
-    # Endpoint #3 — Demand deposit account enquiry (GET with body)
-    # ------------------------------------------------------------------
+    # 4. Trace remaining via BigQuery --------------------------------------
+    trace_rows: list[dict[str, Any]] = []
+    reconciled = (remaining <= 0)
+    amount_reconciled = Decimal("0")
 
-    def get_demand_deposit_account(
-        self,
-        *,
-        hub_customer_token: str,
-        real_account_number: str,
-    ) -> dict[str, Any]:
-        params = {"hubCustomerNumber": hub_customer_token}
-        body = {"sensitiveData": [
-            {"key": hub_customer_token, "value": real_account_number},
-        ]}
-        return self._do(
-            method="GET",
-            path="/api/v1/accounts/demand-deposit",
-            op="demand_deposit",
-            params=params,
-            content=json.dumps(body).encode("utf-8"),
+    if not reconciled:
+        _set_status(session, complaint, ComplaintStatus.TRACING)
+        trace_rows, amount_reconciled = _step_trace(
+            session, gateway, complaint, instrument, incidents, remaining,
+        )
+        reconciled = amount_reconciled >= remaining
+        _set_status(session, complaint, ComplaintStatus.TRACE_COMPLETE)
+
+    reconciliation = {
+        "reconciled":         reconciled,
+        "amountReconciled":   f"{amount_reconciled:.2f}",
+        "shortfall":          f"{max(remaining - amount_reconciled, Decimal('0')):.2f}",
+    }
+
+    # 5. Build + persist final JSON ----------------------------------------
+    final = build_final_response(
+        complaint           = complaint,
+        instrument          = instrument,
+        incidents           = incidents,
+        total_disputed      = total_disputed,
+        available_balance   = available_balance,
+        hold_outcome        = hold_outcome,
+        transaction_details = txn_details,
+        trace_rows          = trace_rows,
+        reconciliation      = reconciliation,
+    )
+
+    _persist_response(session, complaint, final)
+    _set_status(session, complaint, ComplaintStatus.RESOLVED, last_error=None)
+    log.info("Complaint %s RESOLVED", complaint.acknowledgement_no)
+
+
+# ---------------------------------------------------------------------------
+# Loaders + state transitions
+# ---------------------------------------------------------------------------
+
+def _load_complaint(session: Session, complaint_id: int) -> Optional[Complaint]:
+    res = session.execute(
+        select(Complaint)
+        .where(Complaint.id == complaint_id)
+        .options(selectinload(Complaint.instrument).selectinload(Instrument.incidents))
+    )
+    return res.scalar_one_or_none()
+
+
+def _set_status(
+    session: Session,
+    complaint: Complaint,
+    new_status: str,
+    *,
+    last_error: Optional[str] = "__unset__",
+) -> None:
+    complaint.status     = new_status
+    complaint.updated_at = datetime.now(timezone.utc)
+    if last_error != "__unset__":
+        complaint.last_error = last_error
+    session.flush()
+
+
+def _persist_response(
+    session: Session, complaint: Complaint, payload: dict[str, Any]
+) -> None:
+    now = datetime.now(timezone.utc)
+    res = session.execute(
+        select(ComplaintResponse).where(ComplaintResponse.complaint_id == complaint.id)
+    )
+    existing = res.scalar_one_or_none()
+    if existing is None:
+        session.add(ComplaintResponse(
+            complaint_id       = complaint.id,
+            acknowledgement_no = complaint.acknowledgement_no,
+            response_json      = payload,
+            status             = "READY",
+            created_at         = now,
+        ))
+    else:
+        existing.response_json   = payload
+        existing.status          = "READY"
+        existing.sent_at         = None
+        existing.sender_attempts = 0
+    session.flush()
+
+
+# ---------------------------------------------------------------------------
+# Step: demand-deposit (balance enquiry)
+# ---------------------------------------------------------------------------
+
+def _step_demand_deposit(
+    session: Session,
+    gateway: GatewayClient,
+    complaint: Complaint,
+    instrument: Instrument,
+) -> dict[str, Any]:
+    return _idempotent_call(
+        session=session,
+        complaint=complaint,
+        job_id=_job_id("demand_deposit", complaint),
+        call=lambda: gateway.get_demand_deposit_account(
+            hub_customer_token  = instrument.payer_account_number,
+            real_account_number = instrument.payer_account_number,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step: per-incident transaction detail (history if fresh, BQ if historic)
+# ---------------------------------------------------------------------------
+
+def _step_fetch_transaction_detail(
+    session: Session,
+    gateway: GatewayClient,
+    complaint: Complaint,
+    instrument: Instrument,
+    incident: Incident,
+) -> dict[str, Any]:
+    fresh = _is_fresh(incident)
+    source = "txn_history" if fresh else "bq_search"
+    job_id = _job_id(f"txn_detail_{source}", complaint, str(incident.id))
+
+    if fresh:
+        from_dt = incident.transaction_date.isoformat()
+        to_dt   = incident.transaction_date.isoformat()
+        payload = _idempotent_call(
+            session=session,
+            complaint=complaint,
+            job_id=job_id,
+            call=lambda: gateway.get_transaction_history(
+                account_number_token = instrument.payer_account_number,
+                real_account_number  = instrument.payer_account_number,
+                from_date            = from_dt,
+                to_date              = to_dt,
+            ),
+        )
+    else:
+        filters: dict[str, Any] = {
+            BQ_FIELD_BENEFICIARY_ACCOUNT: instrument.payer_account_number,
+            BQ_FIELD_AMOUNT:              float(incident.amount),
+        }
+        payload = _idempotent_call(
+            session=session,
+            complaint=complaint,
+            job_id=job_id,
+            call=lambda: gateway.search_bigquery(filters=filters, limit=10),
         )
 
-    # ------------------------------------------------------------------
-    # Endpoint #4 — BigQuery filtered search (POST)
-    # ------------------------------------------------------------------
+    return {
+        "incidentId":    incident.id,
+        "source":        source,
+        "freshWindow":   fresh,
+        "transactionAt": incident.transaction_at.isoformat() if incident.transaction_at else None,
+        "lookupAmount":  f"{incident.amount:.2f}",
+        "payload":       payload,
+    }
 
-    def search_bigquery(
-        self,
-        *,
-        filters: dict[str, Any],
-        limit:   int = 100,
-    ) -> dict[str, Any]:
-        body: dict[str, Any] = {**filters, "limit": limit}
-        return self._do(
-            method="POST",
-            path="/api/v1/search",
-            op="bq_search",
-            json_body=body,
+
+# ---------------------------------------------------------------------------
+# Step: apply hold (with extra-careful PENDING handling)
+# ---------------------------------------------------------------------------
+
+def _step_apply_hold(
+    session: Session,
+    gateway: GatewayClient,
+    complaint: Complaint,
+    instrument: Instrument,
+    *,
+    hold_amount: Decimal,
+) -> dict[str, Any]:
+    job_id = _job_id("apply_hold", complaint)
+
+    existing = _find_log(session, complaint.id, job_id)
+    if existing is not None:
+        if existing.response_code == CODE_SUCCESS:
+            log.info("apply_hold already succeeded for %s — reusing payload",
+                     complaint.acknowledgement_no)
+            return existing.response_payload or {}
+        if existing.response_code == CODE_PENDING:
+            log.error("apply_hold for %s found PENDING — manual review",
+                      complaint.acknowledgement_no)
+            raise PendingHoldError()
+        # Otherwise it's a failure — re-arm the row as PENDING and try again.
+        existing.response_code    = CODE_PENDING
+        existing.response_message = ApiResponseStatus.PENDING
+        existing.requested_at     = datetime.now(timezone.utc)
+        session.flush()
+        log_row = existing
+    else:
+        log_row = _insert_pending_log(session, complaint=complaint, job_id=job_id)
+
+    # Commit the PENDING marker so a crash mid-call leaves evidence.
+    session.commit()
+
+    try:
+        payload = gateway.apply_account_hold(
+            account_number         = instrument.payer_account_number,
+            account_currency_code  = DEFAULT_CURRENCY,
+            hold_amount            = f"{hold_amount:.2f}",
+            hold_currency          = DEFAULT_CURRENCY,
+            hold_till_expired_date = config.HOLD_EXPIRY_DATE,
         )
+    except GatewayError as e:
+        log_row.response_code    = (str(e.upstream_status or e.status_code))[:10]
+        log_row.response_message = ApiResponseStatus.FAILURE
+        log_row.response_payload = {"error": str(e), "upstream": e.upstream_body}
+        log_row.responded_at     = datetime.now(timezone.utc)
+        log_row.updated_at       = log_row.responded_at
+        session.commit()
+        raise
+
+    _finalise_log(
+        session, log_row,
+        success=True,
+        code=CODE_SUCCESS,
+        payload=payload,
+    )
+    session.commit()
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Step: trace via BigQuery
+# ---------------------------------------------------------------------------
+
+def _step_trace(
+    session: Session,
+    gateway: GatewayClient,
+    complaint: Complaint,
+    instrument: Instrument,
+    incidents: list[Incident],
+    remaining: Decimal,
+) -> tuple[list[dict[str, Any]], Decimal]:
+    seen_merchants: set[str] = {inc.merchant_id for inc in incidents}
+    rows: list[dict[str, Any]] = []
+    cumulative = Decimal("0")
+
+    for merchant in seen_merchants:
+        if cumulative >= remaining or len(rows) >= config.TRACE_MAX_ROWS:
+            break
+
+        job_id = _job_id("trace_bq", complaint, merchant)
+        filters = {BQ_FIELD_BENEFICIARY_ACCOUNT: merchant}
+        payload = _idempotent_call(
+            session=session,
+            complaint=complaint,
+            job_id=job_id,
+            call=lambda f=filters: gateway.search_bigquery(
+                filters=f, limit=config.TRACE_MAX_ROWS,
+            ),
+        )
+
+        for r in (payload.get("rows") or []):
+            rows.append(r)
+            try:
+                amt = Decimal(str(r.get(BQ_FIELD_AMOUNT, 0)))
+            except Exception:
+                amt = Decimal("0")
+            cumulative += amt
+            if cumulative >= remaining or len(rows) >= config.TRACE_MAX_ROWS:
+                break
+
+    log.info("Trace for %s: %d rows, cumulative=%s (target=%s)",
+             complaint.acknowledgement_no, len(rows), cumulative, remaining)
+    return rows, cumulative
+
+
+# ---------------------------------------------------------------------------
+# Generic idempotent call wrapper (everything except apply_hold)
+# ---------------------------------------------------------------------------
+
+def _idempotent_call(
+    *,
+    session: Session,
+    complaint: Complaint,
+    job_id: str,
+    call,
+) -> dict[str, Any]:
+    """Run a downstream call once, log it, and short-circuit on retry."""
+    existing = _find_log(session, complaint.id, job_id)
+    if existing is not None and existing.response_code == CODE_SUCCESS and existing.response_payload:
+        log.info("Reusing cached success for %s (job=%s)",
+                 complaint.acknowledgement_no, job_id)
+        return existing.response_payload
+
+    log_row = existing or _insert_pending_log(session, complaint=complaint, job_id=job_id)
+    if existing is not None:
+        log_row.response_code    = CODE_PENDING
+        log_row.response_message = ApiResponseStatus.PENDING
+        log_row.requested_at     = datetime.now(timezone.utc)
+        session.flush()
+
+    try:
+        payload = call()
+    except GatewayError as e:
+        _finalise_log(
+            session, log_row,
+            success=False,
+            code=str(e.upstream_status or e.status_code),
+            payload={"error": str(e), "upstream": e.upstream_body},
+        )
+        raise
+
+    _finalise_log(
+        session, log_row,
+        success=True,
+        code=CODE_SUCCESS,
+        payload=payload,
+    )
+    return payload
