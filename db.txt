@@ -1,37 +1,30 @@
 """
-db.py — Async SQLAlchemy engine + session factory + claim helper.
+db.py — Sync SQLAlchemy engine + session factory + claim helper.
 
-Two connection modes:
+Connection modes:
+  * Cloud Run: Cloud SQL Python Connector with pg8000 + IAM auth (the
+               team-standard pattern). Triggered by INSTANCE_CONNECTION_NAME
+               being set.
+  * Local:     Plain pg8000 DSN built from DB_HOST/DB_PORT/etc.
 
-  * Cloud Run: Cloud SQL Python Connector with pg8000 driver + IAM auth.
-               Same pattern as the rest of our GCP services. Triggered by
-               INSTANCE_CONNECTION_NAME being set.
-  * Local:    Plain pg8000 DSN built from DB_HOST/DB_PORT/etc.
-
-We use pg8000 (pure-Python Postgres driver) because the Cloud SQL Python
-Connector supports it natively with IAM auth via `enable_iam_auth=True`.
-pg8000 is synchronous, so we wrap it with SQLAlchemy's standard sync engine
-inside async runners. SQLAlchemy handles thread-pool offloading transparently
-via `AsyncEngine` over a sync driver — no asyncpg needed.
+pg8000 is a sync driver, so we use a sync SQLAlchemy Engine here. The
+FastAPI handlers offload DB work to a thread pool via asyncio.to_thread()
+— exactly the pattern your gateway uses for the sync `requests` library.
 
 The claim helper uses `SELECT ... FOR UPDATE SKIP LOCKED` so two sweep
-instances can safely run concurrently without ever grabbing the same row.
+ticks can safely run concurrently without ever grabbing the same row.
 """
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import AsyncIterator, Optional
+from typing import Iterator, Optional
 
 import sqlalchemy
 from sqlalchemy import select, text, update
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
 
 import config
 from logger import get_logger
@@ -44,10 +37,10 @@ log = get_logger(__name__)
 # Connection pool builders
 # ---------------------------------------------------------------------------
 
-def _create_conn_pool_cloud_sql() -> AsyncEngine:
-    """Build an async engine that uses the Cloud SQL Python Connector + pg8000.
+def _create_conn_pool_cloud_sql() -> Engine:
+    """Build an engine using the Cloud SQL Python Connector + pg8000.
 
-    Mirrors the team-standard `_create_conn_pool` pattern:
+    Mirrors the team-standard `_create_conn_pool` pattern verbatim:
       - pg8000 driver
       - enable_iam_auth=True (no password needed; ADC handles it)
       - PRIVATE/PUBLIC IP toggle via env
@@ -76,11 +69,7 @@ def _create_conn_pool_cloud_sql() -> AsyncEngine:
         )
         return conn
 
-    # The Cloud SQL Python Connector is used with SQLAlchemy via the
-    # `creator` argument. We wrap with create_async_engine so the rest of
-    # the app can keep using `async with session_scope()`. SQLAlchemy
-    # automatically offloads sync pg8000 calls to a thread pool.
-    engine = create_async_engine(
+    engine = sqlalchemy.create_engine(
         "postgresql+pg8000://",
         creator=getconn,
         # Pool size — maximum number of permanent connections.
@@ -100,13 +89,13 @@ def _create_conn_pool_cloud_sql() -> AsyncEngine:
     return engine
 
 
-def _create_conn_pool_local() -> AsyncEngine:
+def _create_conn_pool_local() -> Engine:
     """Build an engine for local dev — plain pg8000 DSN with password."""
     dsn = (
         f"postgresql+pg8000://{config.DB_USER}:{config.DB_PASSWORD}"
         f"@{config.DB_HOST}:{config.DB_PORT}/{config.DB_NAME}"
     )
-    engine = create_async_engine(
+    engine = sqlalchemy.create_engine(
         dsn,
         pool_size=config.DB_POOL_SIZE,
         max_overflow=config.DB_MAX_OVERFLOW,
@@ -126,11 +115,11 @@ def _create_conn_pool_local() -> AsyncEngine:
 # Lifecycle
 # ---------------------------------------------------------------------------
 
-_engine: Optional[AsyncEngine] = None
-_sessionmaker: Optional[async_sessionmaker[AsyncSession]] = None
+_engine: Optional[Engine] = None
+_sessionmaker: Optional[sessionmaker[Session]] = None
 
 
-async def init_db() -> None:
+def init_db() -> None:
     """Build engine + sessionmaker once at startup."""
     global _engine, _sessionmaker
     if _engine is not None:
@@ -141,39 +130,39 @@ async def init_db() -> None:
     else:
         _engine = _create_conn_pool_local()
 
-    _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
+    _sessionmaker = sessionmaker(_engine, expire_on_commit=False)
 
     # Sanity check
-    async with _engine.connect() as conn:
-        await conn.execute(text("SELECT 1"))
+    with _engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
     log.info("DB connectivity verified")
 
 
-async def close_db() -> None:
+def close_db() -> None:
     global _engine, _sessionmaker
     if _engine is not None:
-        await _engine.dispose()
+        _engine.dispose()
         _engine = None
         _sessionmaker = None
         log.info("DB engine disposed")
 
 
-def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
+def get_sessionmaker() -> sessionmaker[Session]:
     if _sessionmaker is None:
         raise RuntimeError("DB not initialised — call init_db() first")
     return _sessionmaker
 
 
-@asynccontextmanager
-async def session_scope() -> AsyncIterator[AsyncSession]:
+@contextmanager
+def session_scope() -> Iterator[Session]:
     """Open a session that commits on success and rolls back on error."""
     sm = get_sessionmaker()
-    async with sm() as session:
+    with sm() as session:
         try:
             yield session
-            await session.commit()
+            session.commit()
         except Exception:
-            await session.rollback()
+            session.rollback()
             raise
 
 
@@ -181,8 +170,8 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 # Claim helper — the heart of safe concurrent sweeping
 # ---------------------------------------------------------------------------
 
-async def claim_pending_complaints(
-    session: AsyncSession,
+def claim_pending_complaints(
+    session: Session,
     *,
     batch_size: int,
     max_attempts: int,
@@ -205,13 +194,13 @@ async def claim_pending_complaints(
         .limit(batch_size)
         .with_for_update(skip_locked=True)
     )
-    result = await session.execute(stmt)
+    result = session.execute(stmt)
     ids = [row[0] for row in result.all()]
 
     if not ids:
         return []
 
-    await session.execute(
+    session.execute(
         update(Complaint)
         .where(Complaint.id.in_(ids))
         .values(
