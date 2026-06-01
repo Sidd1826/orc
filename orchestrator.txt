@@ -1,5 +1,5 @@
 """
-orchestrator.py — Per-complaint state machine.
+orchestrator.py — Per-complaint state machine (sync).
 
 Every external side-effect is logged to `api_response_logs` with a
 deterministic job_id, and the database itself prevents two successful holds
@@ -10,30 +10,28 @@ Idempotency strategy
 For each downstream call the orchestrator follows the same pattern:
 
   1. Check api_response_logs for an existing row with this complaint's
-     job_id. If it exists and is SUCCESS — short-circuit, reuse the payload.
-  2. Otherwise INSERT a PENDING row (deterministic job_id makes this safe to
-     retry — a duplicate INSERT fails the uniqueness constraint, and we
-     fall back to step 1).
+     job_id. If response_code='00' (success) — short-circuit, reuse payload.
+  2. Otherwise INSERT a PENDING marker row (response_code='PEND'). The
+     deterministic job_id makes this safe to retry.
   3. Make the call.
-  4. UPDATE the row to SUCCESS / FAILURE / TIMEOUT.
+  4. UPDATE the row with the final response_code:
+       - '00'  on success         (Postgres marks is_success=true)
+       - error code on failure    (is_success=false)
 
-If the worker crashes between step 3 and step 4 for the apply_hold call, the
-next attempt sees a PENDING row and routes the complaint to MANUAL_REVIEW —
+If the worker crashes between step 3 and 4 for the apply_hold call, the
+next attempt sees a 'PEND' row and routes the complaint to MANUAL_REVIEW —
 we *never* speculatively re-call apply_hold, because that risks a double
-hold on a customer account. Ops will verify state on the account and either
-mark the row SUCCESS or FAILURE manually, then re-queue the complaint.
+hold on a customer account.
 """
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import Session, selectinload
 
 import config
 from gateway_client import GatewayClient, GatewayError
@@ -53,20 +51,23 @@ log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Tunables / mappings
-#
-# The BQ schema in the gateway is keyed by short codes (OGBEAC, OGTRNO, ...).
-# These constants name them once so every reference is consistent and the
-# mapping is easy to revisit when the business confirms the contract.
+# Response-code constants — match the schema's "00 = success" contract.
 # ---------------------------------------------------------------------------
 
-BQ_FIELD_BENEFICIARY_ACCOUNT = "OGBEAC"   # Beneficiary A/C No (where money went)
+CODE_SUCCESS = "00"     # Postgres-generated is_success flips to true
+CODE_PENDING = "PEND"   # Marker for a call that's been started but not yet finalised
+
+
+# ---------------------------------------------------------------------------
+# BQ field mappings (see bq_client.py in the gateway)
+# ---------------------------------------------------------------------------
+
+BQ_FIELD_BENEFICIARY_ACCOUNT = "OGBEAC"   # Beneficiary A/C No
 BQ_FIELD_TRANSACTION_REF     = "OGTRNO"   # Transaction Reference No
 BQ_FIELD_AMOUNT              = "OGPYAM"   # Payment Amount
 BQ_FIELD_CURRENCY            = "OGPYCY"   # Payment Currency
 BQ_FIELD_CAPTURE_DATE        = "OGCPDT"   # Capture Date (INT64, e.g. 20260926)
 
-# Currency assumption — adjust when the upstream schema confirms otherwise.
 DEFAULT_CURRENCY = "INR"
 
 
@@ -89,7 +90,7 @@ class PendingHoldError(OrchestratorError):
         super().__init__(
             "Found a PENDING apply_hold row from a previous attempt — "
             "manual verification required",
-            terminal=True,  # don't auto-retry; ops needs to look
+            terminal=True,
         )
 
 
@@ -100,13 +101,11 @@ class PendingHoldError(OrchestratorError):
 def _job_id(op: str, complaint: Complaint, *parts: str) -> str:
     """Build a deterministic job_id for a logical call attempt.
 
-    Format: '<op>:<ack_no>[:<extra>]'.  job_id is unique per (complaint, op),
-    which the composite index on api_response_logs enforces.
+    Length cap: api_response_logs.job_id is VARCHAR(60).
     """
     tail = ":".join(parts)
     suffix = f":{tail}" if tail else ""
     base = f"{op}:{complaint.acknowledgement_no}{suffix}"
-    # Length cap (api_response_logs.job_id is VARCHAR(60))
     if len(base) > 60:
         h = hashlib.sha1(base.encode()).hexdigest()[:10]
         base = base[:49] + ":" + h
@@ -117,10 +116,10 @@ def _job_id(op: str, complaint: Complaint, *parts: str) -> str:
 # api_response_logs helpers
 # ---------------------------------------------------------------------------
 
-async def _find_log(
-    session: AsyncSession, complaint_id: int, job_id: str
+def _find_log(
+    session: Session, complaint_id: int, job_id: str
 ) -> Optional[ApiResponseLog]:
-    res = await session.execute(
+    res = session.execute(
         select(ApiResponseLog).where(
             ApiResponseLog.complaint_id == complaint_id,
             ApiResponseLog.job_id == job_id,
@@ -129,8 +128,8 @@ async def _find_log(
     return res.scalar_one_or_none()
 
 
-async def _insert_pending_log(
-    session: AsyncSession,
+def _insert_pending_log(
+    session: Session,
     *,
     complaint: Complaint,
     job_id: str,
@@ -140,21 +139,20 @@ async def _insert_pending_log(
         complaint_id       = complaint.id,
         acknowledgement_no = complaint.acknowledgement_no,
         job_id             = job_id,
-        response_code      = "",
+        response_code      = CODE_PENDING,
         response_message   = ApiResponseStatus.PENDING,
         response_payload   = None,
-        is_success         = False,
         requested_at       = now,
         created_at         = now,
         updated_at         = now,
     )
     session.add(row)
-    await session.flush()
+    session.flush()
     return row
 
 
-async def _finalise_log(
-    session: AsyncSession,
+def _finalise_log(
+    session: Session,
     log_row: ApiResponseLog,
     *,
     success: bool,
@@ -162,17 +160,13 @@ async def _finalise_log(
     payload: Any,
 ) -> None:
     now = datetime.now(timezone.utc)
-    log_row.response_code    = code[:10]
+    # On success force '00' so the GENERATED is_success column flips to true.
+    log_row.response_code    = CODE_SUCCESS if success else (code[:10] if code else "ERR")
     log_row.response_message = ApiResponseStatus.SUCCESS if success else ApiResponseStatus.FAILURE
     log_row.response_payload = payload if isinstance(payload, dict) else {"raw": payload}
-    log_row.is_success       = success
     log_row.responded_at     = now
     log_row.updated_at       = now
-    if log_row.requested_at:
-        log_row.response_latency_ms = int(
-            (now - log_row.requested_at).total_seconds() * 1000
-        )
-    await session.flush()
+    session.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -190,8 +184,7 @@ def _extract_balance(demand_deposit_payload: dict[str, Any]) -> Optional[Decimal
 
     The exact JSON path depends on the HSBC Hub response shape, which isn't
     documented in the gateway code. We try a handful of common locations and
-    return None if nothing matches — caller treats None as "balance unknown"
-    and routes the complaint to MANUAL_REVIEW.
+    return None if nothing matches — caller treats None as MANUAL_REVIEW.
     """
     candidates = [
         ("data", "availableBalance"),
@@ -220,18 +213,14 @@ def _extract_balance(demand_deposit_payload: dict[str, Any]) -> Optional[Decimal
 # Main entry point
 # ---------------------------------------------------------------------------
 
-async def process_complaint(
+def process_complaint(
     *,
-    session: AsyncSession,
+    session: Session,
     gateway: GatewayClient,
     complaint_id: int,
 ) -> None:
-    """Run the full state machine for one complaint.
-
-    Caller (the sweep) has already moved the complaint to PROCESSING and
-    holds the row lock via the enclosing transaction.
-    """
-    complaint = await _load_complaint(session, complaint_id)
+    """Run the full state machine for one complaint."""
+    complaint = _load_complaint(session, complaint_id)
     if complaint is None:
         log.warning("Complaint %d disappeared mid-flight", complaint_id)
         return
@@ -246,32 +235,33 @@ async def process_complaint(
     if not incidents:
         log.warning("Complaint %s has no incidents — routing to MANUAL_REVIEW",
                     complaint.acknowledgement_no)
-        await _set_status(session, complaint, ComplaintStatus.MANUAL_REVIEW,
-                          last_error="No incidents present")
+        _set_status(session, complaint, ComplaintStatus.MANUAL_REVIEW,
+                    last_error="No incidents present")
         return
 
     log.info("Processing complaint %s | instrument=%s incidents=%d",
              complaint.acknowledgement_no, instrument.id, len(incidents))
 
     # 1. Balance enquiry ----------------------------------------------------
-    balance_payload = await _step_demand_deposit(session, gateway, complaint, instrument)
+    balance_payload = _step_demand_deposit(session, gateway, complaint, instrument)
     available_balance = _extract_balance(balance_payload)
 
     if available_balance is None:
         log.error("Could not parse balance from demand-deposit response — manual review")
-        await _set_status(session, complaint, ComplaintStatus.MANUAL_REVIEW,
-                          last_error="Unable to parse availableBalance")
+        _set_status(session, complaint, ComplaintStatus.MANUAL_REVIEW,
+                    last_error="Unable to parse availableBalance")
         return
 
-    log.info("Complaint %s | available_balance=%s", complaint.acknowledgement_no, available_balance)
-    await _set_status(session, complaint, ComplaintStatus.BALANCE_FETCHED)
+    log.info("Complaint %s | available_balance=%s",
+             complaint.acknowledgement_no, available_balance)
+    _set_status(session, complaint, ComplaintStatus.BALANCE_FETCHED)
 
     # 2. Per-incident transaction enquiry ----------------------------------
     txn_details: list[dict[str, Any]] = []
     total_disputed = Decimal("0")
     for inc in incidents:
         total_disputed += inc.disputed_amount
-        detail = await _step_fetch_transaction_detail(
+        detail = _step_fetch_transaction_detail(
             session, gateway, complaint, instrument, inc,
         )
         txn_details.append(detail)
@@ -285,7 +275,7 @@ async def process_complaint(
         remaining = total_disputed
     else:
         hold_amount = min(total_disputed, available_balance)
-        hold_payload = await _step_apply_hold(
+        hold_payload = _step_apply_hold(
             session, gateway, complaint, instrument,
             hold_amount=hold_amount,
         )
@@ -293,10 +283,10 @@ async def process_complaint(
         hold_outcome = {
             "status":    "FULL" if is_full else "PARTIAL",
             "amount":    f"{hold_amount:.2f}",
-            "reference": hold_payload.get("requestId") or hold_payload.get("data", {}).get("reference"),
+            "reference": hold_payload.get("requestId") or hold_payload.get("data", {}).get("holdReference"),
         }
         remaining = total_disputed - hold_amount
-        await _set_status(
+        _set_status(
             session, complaint,
             ComplaintStatus.HOLD_APPLIED_FULL if is_full else ComplaintStatus.HOLD_APPLIED_PARTIAL,
         )
@@ -307,12 +297,12 @@ async def process_complaint(
     amount_reconciled = Decimal("0")
 
     if not reconciled:
-        await _set_status(session, complaint, ComplaintStatus.TRACING)
-        trace_rows, amount_reconciled = await _step_trace(
+        _set_status(session, complaint, ComplaintStatus.TRACING)
+        trace_rows, amount_reconciled = _step_trace(
             session, gateway, complaint, instrument, incidents, remaining,
         )
         reconciled = amount_reconciled >= remaining
-        await _set_status(session, complaint, ComplaintStatus.TRACE_COMPLETE)
+        _set_status(session, complaint, ComplaintStatus.TRACE_COMPLETE)
 
     reconciliation = {
         "reconciled":         reconciled,
@@ -333,8 +323,8 @@ async def process_complaint(
         reconciliation      = reconciliation,
     )
 
-    await _persist_response(session, complaint, final)
-    await _set_status(session, complaint, ComplaintStatus.RESOLVED, last_error=None)
+    _persist_response(session, complaint, final)
+    _set_status(session, complaint, ComplaintStatus.RESOLVED, last_error=None)
     log.info("Complaint %s RESOLVED", complaint.acknowledgement_no)
 
 
@@ -342,8 +332,8 @@ async def process_complaint(
 # Loaders + state transitions
 # ---------------------------------------------------------------------------
 
-async def _load_complaint(session: AsyncSession, complaint_id: int) -> Optional[Complaint]:
-    res = await session.execute(
+def _load_complaint(session: Session, complaint_id: int) -> Optional[Complaint]:
+    res = session.execute(
         select(Complaint)
         .where(Complaint.id == complaint_id)
         .options(selectinload(Complaint.instrument).selectinload(Instrument.incidents))
@@ -351,8 +341,8 @@ async def _load_complaint(session: AsyncSession, complaint_id: int) -> Optional[
     return res.scalar_one_or_none()
 
 
-async def _set_status(
-    session: AsyncSession,
+def _set_status(
+    session: Session,
     complaint: Complaint,
     new_status: str,
     *,
@@ -362,16 +352,14 @@ async def _set_status(
     complaint.updated_at = datetime.now(timezone.utc)
     if last_error != "__unset__":
         complaint.last_error = last_error
-    await session.flush()
+    session.flush()
 
 
-async def _persist_response(
-    session: AsyncSession, complaint: Complaint, payload: dict[str, Any]
+def _persist_response(
+    session: Session, complaint: Complaint, payload: dict[str, Any]
 ) -> None:
     now = datetime.now(timezone.utc)
-    # UPSERT semantics: complaint_responses.complaint_id is UNIQUE, so a
-    # re-run must update in place rather than insert a duplicate.
-    res = await session.execute(
+    res = session.execute(
         select(ComplaintResponse).where(ComplaintResponse.complaint_id == complaint.id)
     )
     existing = res.scalar_one_or_none()
@@ -388,20 +376,20 @@ async def _persist_response(
         existing.status          = "READY"
         existing.sent_at         = None
         existing.sender_attempts = 0
-    await session.flush()
+    session.flush()
 
 
 # ---------------------------------------------------------------------------
 # Step: demand-deposit (balance enquiry)
 # ---------------------------------------------------------------------------
 
-async def _step_demand_deposit(
-    session: AsyncSession,
+def _step_demand_deposit(
+    session: Session,
     gateway: GatewayClient,
     complaint: Complaint,
     instrument: Instrument,
 ) -> dict[str, Any]:
-    return await _idempotent_call(
+    return _idempotent_call(
         session=session,
         complaint=complaint,
         job_id=_job_id("demand_deposit", complaint),
@@ -416,8 +404,8 @@ async def _step_demand_deposit(
 # Step: per-incident transaction detail (history if fresh, BQ if historic)
 # ---------------------------------------------------------------------------
 
-async def _step_fetch_transaction_detail(
-    session: AsyncSession,
+def _step_fetch_transaction_detail(
+    session: Session,
     gateway: GatewayClient,
     complaint: Complaint,
     instrument: Instrument,
@@ -429,8 +417,8 @@ async def _step_fetch_transaction_detail(
 
     if fresh:
         from_dt = incident.transaction_date.isoformat()
-        to_dt   = (incident.transaction_date).isoformat()
-        payload = await _idempotent_call(
+        to_dt   = incident.transaction_date.isoformat()
+        payload = _idempotent_call(
             session=session,
             complaint=complaint,
             job_id=job_id,
@@ -442,12 +430,11 @@ async def _step_fetch_transaction_detail(
             ),
         )
     else:
-        # BQ lookup for the original fraud transaction by account + amount.
         filters: dict[str, Any] = {
             BQ_FIELD_BENEFICIARY_ACCOUNT: instrument.payer_account_number,
             BQ_FIELD_AMOUNT:              float(incident.amount),
         }
-        payload = await _idempotent_call(
+        payload = _idempotent_call(
             session=session,
             complaint=complaint,
             job_id=job_id,
@@ -468,8 +455,8 @@ async def _step_fetch_transaction_detail(
 # Step: apply hold (with extra-careful PENDING handling)
 # ---------------------------------------------------------------------------
 
-async def _step_apply_hold(
-    session: AsyncSession,
+def _step_apply_hold(
+    session: Session,
     gateway: GatewayClient,
     complaint: Complaint,
     instrument: Instrument,
@@ -478,33 +465,30 @@ async def _step_apply_hold(
 ) -> dict[str, Any]:
     job_id = _job_id("apply_hold", complaint)
 
-    # Pre-flight idempotency check — the hold is the one call we MUST NOT
-    # blindly retry.
-    existing = await _find_log(session, complaint.id, job_id)
+    existing = _find_log(session, complaint.id, job_id)
     if existing is not None:
-        if existing.is_success:
+        if existing.response_code == CODE_SUCCESS:
             log.info("apply_hold already succeeded for %s — reusing payload",
                      complaint.acknowledgement_no)
             return existing.response_payload or {}
-        if existing.response_message == ApiResponseStatus.PENDING:
+        if existing.response_code == CODE_PENDING:
             log.error("apply_hold for %s found PENDING — manual review",
                       complaint.acknowledgement_no)
             raise PendingHoldError()
-        # FAILURE — fall through and try again. Overwrite the old row's
-        # status to PENDING before retrying.
+        # Otherwise it's a failure — re-arm the row as PENDING and try again.
+        existing.response_code    = CODE_PENDING
         existing.response_message = ApiResponseStatus.PENDING
         existing.requested_at     = datetime.now(timezone.utc)
-        await session.flush()
+        session.flush()
         log_row = existing
     else:
-        log_row = await _insert_pending_log(session, complaint=complaint, job_id=job_id)
+        log_row = _insert_pending_log(session, complaint=complaint, job_id=job_id)
 
-    # Commit the PENDING row immediately so a crash mid-call leaves a marker.
-    await session.commit()
+    # Commit the PENDING marker so a crash mid-call leaves evidence.
+    session.commit()
 
-    # The actual call
     try:
-        payload = await gateway.apply_account_hold(
+        payload = gateway.apply_account_hold(
             account_number         = instrument.payer_account_number,
             account_currency_code  = DEFAULT_CURRENCY,
             hold_amount            = f"{hold_amount:.2f}",
@@ -512,46 +496,36 @@ async def _step_apply_hold(
             hold_till_expired_date = config.HOLD_EXPIRY_DATE,
         )
     except GatewayError as e:
-        # We need a new transaction context to record the failure since we
-        # committed above. The caller's session is still usable.
-        log_row.response_code    = str(e.upstream_status or e.status_code)[:10]
+        log_row.response_code    = (str(e.upstream_status or e.status_code))[:10]
         log_row.response_message = ApiResponseStatus.FAILURE
         log_row.response_payload = {"error": str(e), "upstream": e.upstream_body}
-        log_row.is_success       = False
         log_row.responded_at     = datetime.now(timezone.utc)
         log_row.updated_at       = log_row.responded_at
-        await session.commit()
+        session.commit()
         raise
 
-    await _finalise_log(
+    _finalise_log(
         session, log_row,
         success=True,
-        code=str(payload.get("data", {}).get("status", "OK"))[:10],
+        code=CODE_SUCCESS,
         payload=payload,
     )
-    await session.commit()
+    session.commit()
     return payload
 
 
 # ---------------------------------------------------------------------------
-# Step: trace via BigQuery — pull outgoing debits until the remaining
-# disputed amount is covered (or we hit TRACE_MAX_ROWS).
+# Step: trace via BigQuery
 # ---------------------------------------------------------------------------
 
-async def _step_trace(
-    session: AsyncSession,
+def _step_trace(
+    session: Session,
     gateway: GatewayClient,
     complaint: Complaint,
     instrument: Instrument,
     incidents: list[Incident],
     remaining: Decimal,
 ) -> tuple[list[dict[str, Any]], Decimal]:
-    """Fetch BQ rows of debits to chase the fraud trail.
-
-    Strategy: search for outgoing transactions where the beneficiary account
-    is the original fraud destination (incidents[*].merchant_id). Sort by
-    capture date and accumulate amounts until `remaining` is covered.
-    """
     seen_merchants: set[str] = {inc.merchant_id for inc in incidents}
     rows: list[dict[str, Any]] = []
     cumulative = Decimal("0")
@@ -562,7 +536,7 @@ async def _step_trace(
 
         job_id = _job_id("trace_bq", complaint, merchant)
         filters = {BQ_FIELD_BENEFICIARY_ACCOUNT: merchant}
-        payload = await _idempotent_call(
+        payload = _idempotent_call(
             session=session,
             complaint=complaint,
             job_id=job_id,
@@ -590,30 +564,31 @@ async def _step_trace(
 # Generic idempotent call wrapper (everything except apply_hold)
 # ---------------------------------------------------------------------------
 
-async def _idempotent_call(
+def _idempotent_call(
     *,
-    session: AsyncSession,
+    session: Session,
     complaint: Complaint,
     job_id: str,
     call,
 ) -> dict[str, Any]:
     """Run a downstream call once, log it, and short-circuit on retry."""
-    existing = await _find_log(session, complaint.id, job_id)
-    if existing is not None and existing.is_success and existing.response_payload:
+    existing = _find_log(session, complaint.id, job_id)
+    if existing is not None and existing.response_code == CODE_SUCCESS and existing.response_payload:
         log.info("Reusing cached success for %s (job=%s)",
                  complaint.acknowledgement_no, job_id)
         return existing.response_payload
 
-    log_row = existing or await _insert_pending_log(session, complaint=complaint, job_id=job_id)
+    log_row = existing or _insert_pending_log(session, complaint=complaint, job_id=job_id)
     if existing is not None:
+        log_row.response_code    = CODE_PENDING
         log_row.response_message = ApiResponseStatus.PENDING
         log_row.requested_at     = datetime.now(timezone.utc)
-        await session.flush()
+        session.flush()
 
     try:
-        payload = await call()
+        payload = call()
     except GatewayError as e:
-        await _finalise_log(
+        _finalise_log(
             session, log_row,
             success=False,
             code=str(e.upstream_status or e.status_code),
@@ -621,10 +596,10 @@ async def _idempotent_call(
         )
         raise
 
-    await _finalise_log(
+    _finalise_log(
         session, log_row,
         success=True,
-        code="OK",
+        code=CODE_SUCCESS,
         payload=payload,
     )
     return payload
