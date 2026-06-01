@@ -1,19 +1,15 @@
 """
-gateway_client.py — Typed async client for the sibling HSBC MHA Gateway.
+gateway_client.py — Sync httpx client for the sibling HSBC MHA Gateway.
 
-Wraps the four endpoints we need from the gateway:
+Wraps the four endpoints we need:
 
   * GET  /api/v1/transactions/history
   * POST /api/v1/accounts/apply-hold
   * GET  /api/v1/accounts/demand-deposit
   * POST /api/v1/search                  (BigQuery filtered search)
 
-Auth: Cloud-Run-to-Cloud-Run identity tokens via google-auth. The ID token is
-fetched once per call (the underlying library caches/refreshes for us). The
-audience must be the gateway's root URL. Toggle off via GATEWAY_USE_IAM_AUTH
-for local dev / unauthenticated UAT.
-
-verify=True — gateway uses standard public Cloud Run TLS.
+Auth: Cloud-Run-to-Cloud-Run identity tokens via google-auth (toggleable).
+Sync because pg8000 is sync; main.py offloads everything to a thread pool.
 """
 from __future__ import annotations
 
@@ -52,9 +48,9 @@ class GatewayError(Exception):
 # ---------------------------------------------------------------------------
 
 class GatewayClient:
-    """Async wrapper around the gateway service."""
+    """Sync wrapper around the gateway service."""
 
-    def __init__(self, http: httpx.AsyncClient) -> None:
+    def __init__(self, http: httpx.Client) -> None:
         if not config.GATEWAY_BASE_URL:
             raise RuntimeError("GATEWAY_BASE_URL is not set")
         self._http = http
@@ -73,7 +69,6 @@ class GatewayClient:
         """Fetch an ID token for Cloud Run service-to-service auth."""
         if not self._use_iam:
             return None
-        # Imported lazily so local dev without google-auth still works.
         import google.auth.transport.requests
         import google.oauth2.id_token
 
@@ -89,7 +84,7 @@ class GatewayClient:
     # Core dispatch
     # ------------------------------------------------------------------
 
-    async def _do(
+    def _do(
         self,
         *,
         method: str,
@@ -109,7 +104,7 @@ class GatewayClient:
 
         log.info("Gateway -> %s %s (op=%s)", method, path, op)
         try:
-            resp = await self._http.request(
+            resp = self._http.request(
                 method=method,
                 url=url,
                 params=params,
@@ -142,13 +137,10 @@ class GatewayClient:
         return data
 
     # ------------------------------------------------------------------
-    # Endpoint #1 — Transaction history (GET, body = sensitiveData)
-    #
-    # The gateway accepts a JSON body alongside the GET query string. httpx
-    # supports this via the `content` argument.
+    # Endpoint #1 — Transaction history (GET with body)
     # ------------------------------------------------------------------
 
-    async def get_transaction_history(
+    def get_transaction_history(
         self,
         *,
         account_number_token: str,
@@ -165,7 +157,7 @@ class GatewayClient:
         body = {"sensitiveData": [
             {"key": account_number_token, "value": real_account_number},
         ]}
-        return await self._do(
+        return self._do(
             method="GET",
             path="/api/v1/transactions/history",
             op="transaction_history",
@@ -177,14 +169,14 @@ class GatewayClient:
     # Endpoint #2 — Apply account hold (POST)
     # ------------------------------------------------------------------
 
-    async def apply_account_hold(
+    def apply_account_hold(
         self,
         *,
         account_number:        str,
         account_currency_code: str,
-        hold_amount:           str,        # decimal string, e.g. "28.28"
+        hold_amount:           str,
         hold_currency:         str,
-        hold_till_expired_date: str,       # YYYY-MM-DD
+        hold_till_expired_date: str,
         hold_type:             str = "B",
     ) -> dict[str, Any]:
         body = {
@@ -197,7 +189,7 @@ class GatewayClient:
                 "holdAmount":           hold_amount,
             }
         }
-        return await self._do(
+        return self._do(
             method="POST",
             path="/api/v1/accounts/apply-hold",
             op="apply_hold",
@@ -205,10 +197,10 @@ class GatewayClient:
         )
 
     # ------------------------------------------------------------------
-    # Endpoint #3 — Demand deposit account enquiry (GET + sensitiveData body)
+    # Endpoint #3 — Demand deposit account enquiry (GET with body)
     # ------------------------------------------------------------------
 
-    async def get_demand_deposit_account(
+    def get_demand_deposit_account(
         self,
         *,
         hub_customer_token: str,
@@ -218,7 +210,7 @@ class GatewayClient:
         body = {"sensitiveData": [
             {"key": hub_customer_token, "value": real_account_number},
         ]}
-        return await self._do(
+        return self._do(
             method="GET",
             path="/api/v1/accounts/demand-deposit",
             op="demand_deposit",
@@ -230,14 +222,14 @@ class GatewayClient:
     # Endpoint #4 — BigQuery filtered search (POST)
     # ------------------------------------------------------------------
 
-    async def search_bigquery(
+    def search_bigquery(
         self,
         *,
         filters: dict[str, Any],
         limit:   int = 100,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {**filters, "limit": limit}
-        return await self._do(
+        return self._do(
             method="POST",
             path="/api/v1/search",
             op="bq_search",
