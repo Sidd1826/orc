@@ -1,0 +1,6 @@
+SELECT acknowledgement_no, processing_state, attempt_count, last_error
+FROM complaint_processing;
+
+SELECT step, status, count(*) FROM processing_steps GROUP BY 1,2;
+
+SELECT acknowledgement_no, response_payload FROM api_response_logs;
