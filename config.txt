@@ -58,8 +58,16 @@ MAX_ATTEMPTS              = _env_int("MAX_ATTEMPTS", 5)
 MAX_TRACE_LAYERS          = _env_int("MAX_TRACE_LAYERS", 5)
 
 # --- Upstream JSON field paths (CONFIRM against real HSBC contracts) ---
-DD_AVAILABLE_BALANCE_PATH = _env("DD_AVAILABLE_BALANCE_PATH", "data.availableBalance")
-DD_BENEFICIARY_PATH       = _env("DD_BENEFICIARY_PATH", "data.beneficiary")
+# --- Balance enquiry: path to the balance amount in the demand-deposit
+#     response. Real HSBC shape is accounts[].currentBalance.amount. Dotted
+#     path supports list indices (e.g. accounts.0...). Switch the last-but-one
+#     segment to availableBalance if you ever need available instead.
+BALANCE_PATH = _env("BALANCE_PATH", "accounts.0.currentBalance.amount")
+
+# --- Apply-hold mandatory fields ---
+HOLD_TYPE      = _env("HOLD_TYPE", "F")            # per your sample (F)
+HOLD_TILL_DATE = _env("HOLD_TILL_DATE", "2099-12-31")
+HOLD_CURRENCY  = _env("HOLD_CURRENCY", "INR")
 
 # --- BigQuery (CBDOC) field mapping ---
 BQ_FIELD_REF          = _env("BQ_FIELD_REF", "OGTRNO")

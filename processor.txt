@@ -63,10 +63,16 @@ def _now() -> datetime:
 
 
 def _dig(d: Any, path: str) -> Any:
-    """Read a dotted path out of a nested dict; None if missing."""
+    """Read a dotted path out of a nested dict/list; None if missing.
+    Numeric path segments index into lists, e.g. 'accounts.0.currentBalance.amount'."""
     cur = d
     for part in path.split("."):
-        if isinstance(cur, dict) and part in cur:
+        if isinstance(cur, list):
+            try:
+                cur = cur[int(part)]
+            except (ValueError, IndexError):
+                return None
+        elif isinstance(cur, dict) and part in cur:
             cur = cur[part]
         else:
             return None
@@ -208,6 +214,8 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
             if cls.channel == CHANNEL_UPI and cls.direction == DIR_DEBIT:
                 _finalize_bene_only(s, p, incidents)
                 p.processing_state = ST_RESOLVED
+                p.lease_expires_at = None
+                s.add(p); s.commit()
                 break
             p.processing_state = ST_BALANCE_CHECKED
 
@@ -233,6 +241,7 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
             if not reconciled:
                 p.last_error = "could not fully reconcile within trace-layer cap"
             p.lease_expires_at = None
+            s.add(p); s.commit()
             break
 
         s.add(p)
@@ -297,7 +306,8 @@ def _unstash(s: Session, p: ComplaintProcessing, name: str) -> dict:
 
 def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
             incidents: list[Incident]) -> None:
-    """Fetch beneficiary / transaction context: UPI bene, live DD, or CBDOC."""
+    """Fetch beneficiary / transaction context: UPI bene, live transaction
+    enquiry (< 24h), or CBDOC/BigQuery (> 24h)."""
     account = instrument.payer_account_number
 
     if cls.channel == CHANNEL_UPI and cls.direction == DIR_DEBIT:
@@ -310,18 +320,66 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
                 rrn=inc.merchant_id, account_number=account,
                 amount=str(inc.amount), transaction_timestamp=ts,
             )
-            _step_record(s, p, "UPI_BENE", idem,
-                         {"rrn": inc.merchant_id}, resp)
+            _step_record(s, p, "UPI_BENE", idem, {"rrn": inc.merchant_id}, resp)
         return
 
     if cls.is_recent:
-        _dd_enquiry(s, p, account)              # live demand-deposit
+        # Transaction enquiry: fetch the account's transactions once, then find
+        # each incident's transaction by matching its RRN in the narratives.
+        from_date = min(i.transaction_date for i in incidents).isoformat()
+        resp = _txn_enquiry(s, p, account, from_date)
+        details = _dig(resp, "accountInformation.transactionDetails") or []
+        for inc in incidents:
+            idem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
+            if _step_get(s, p, "DD_TXN", idem):
+                continue
+            matched = _find_txn_by_rrn(details, inc.merchant_id)
+            _step_record(s, p, "DD_TXN", idem,
+                         {"rrn": inc.merchant_id},
+                         {"found": matched is not None, "matched": matched or {}})
+            if matched is None:
+                log.warning("[%s] no transaction matched RRN=%s in enquiry",
+                            p.acknowledgement_no, inc.merchant_id)
     else:
         for inc in incidents:                   # CBDOC / BigQuery archive
             _bq_locate(s, p, account, inc)
 
 
+def _txn_enquiry(s: Session, p: ComplaintProcessing, account: str, from_date: str) -> dict:
+    idem = f"TXN:{p.acknowledgement_no}:{account}"
+    existing = _step_get(s, p, "TXN_ENQUIRY", idem)
+    if existing and existing.status == "SUCCESS":
+        return existing.response_payload or {}
+    resp = gateway().transaction_history(account, from_date=from_date)
+    _step_record(s, p, "TXN_ENQUIRY", idem,
+                 {"account": account, "fromDate": from_date}, resp)
+    return resp
+
+
+def _narratives(txn: dict) -> list[str]:
+    out = []
+    for d in (txn.get("transactionDescription") or []):
+        nv = d.get("transactionNarrative") if isinstance(d, dict) else None
+        if isinstance(nv, str) and nv.strip():
+            out.append(nv.strip())
+    return out
+
+
+def _find_txn_by_rrn(details: list[dict], rrn: str) -> Optional[dict]:
+    """Iterate every transaction's narratives; match the one whose narrative is
+    (or contains as a '/'-separated token) the RRN."""
+    rrn = (rrn or "").strip()
+    if not rrn:
+        return None
+    for txn in details:
+        for nv in _narratives(txn):
+            if nv == rrn or rrn in [t.strip() for t in nv.split("/")]:
+                return txn
+    return None
+
+
 def _dd_enquiry(s: Session, p: ComplaintProcessing, account: str) -> dict:
+    """Demand-deposit / balance enquiry — returns the accounts[] structure."""
     idem = f"DD:{p.acknowledgement_no}:{account}"
     existing = _step_get(s, p, "DD_ENQUIRY", idem)
     if existing and existing.status == "SUCCESS":
@@ -332,12 +390,13 @@ def _dd_enquiry(s: Session, p: ComplaintProcessing, account: str) -> dict:
 
 
 def _available_balance(s: Session, p: ComplaintProcessing, account: str) -> Decimal:
+    """Balance used for the hold decision = accounts[].currentBalance.amount."""
     resp = _dd_enquiry(s, p, account)
-    raw = _dig(resp, config.DD_AVAILABLE_BALANCE_PATH)
+    raw = _dig(resp, config.BALANCE_PATH)
     if raw is None:
         raise GatewayError(
-            f"available balance not found at path '{config.DD_AVAILABLE_BALANCE_PATH}' "
-            f"in DD response (keys={list(resp.keys())})"
+            f"balance not found at path '{config.BALANCE_PATH}' "
+            f"in balance-enquiry response (top keys={list(resp.keys())})"
         )
     return Decimal(str(raw))
 
@@ -374,7 +433,7 @@ def _apply_holds(s: Session, p: ComplaintProcessing, instrument: Instrument,
         return Decimal("0"), remaining
 
     account = instrument.payer_account_number
-    currency = "INR"
+    currency = config.HOLD_CURRENCY
     amount_str = f"{to_hold:.2f}"
     # Idempotency key ties the hold to (ack, account, amount): a retry that
     # finds a SUCCESS here will NOT call apply-hold again.
@@ -393,7 +452,11 @@ def _apply_holds(s: Session, p: ComplaintProcessing, instrument: Instrument,
     if step.status == "SUCCESS":
         return to_hold, remaining
 
-    resp = gateway().apply_hold(account_number=account, currency=currency, amount=amount_str)
+    resp = gateway().apply_hold(
+        account_number=account, currency=currency, amount=amount_str,
+        hold_type=config.HOLD_TYPE, hold_till=config.HOLD_TILL_DATE,
+        hold_narrative2=f"FRAUD {p.acknowledgement_no}"[:35],
+    )
     step.status = "SUCCESS"
     step.response_payload = resp
     s.flush()
@@ -412,6 +475,7 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
     debited transaction. Returns (collected_transactions, fully_reconciled)."""
     collected: list[dict] = []
     recovered = Decimal("0")
+    seen_accounts: set[str] = set()
 
     # Seed the frontier with the beneficiary account(s) of the fraud incidents.
     frontier: list[str] = []
@@ -421,13 +485,16 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
             collected.append(_to_mha_txn(row))
             recovered += _row_amount(row)
             nxt = row.get(config.BQ_FIELD_BENE_ACCOUNT)
-            if nxt:
+            if nxt and str(nxt) not in seen_accounts:
                 frontier.append(str(nxt))
 
     layer = 1
     while frontier and recovered < remaining and layer <= config.MAX_TRACE_LAYERS:
         next_frontier: list[str] = []
         for acct in frontier:
+            if acct in seen_accounts:        # already traced — avoid loops/double-count
+                continue
+            seen_accounts.add(acct)
             idem = f"BQLAYER:{p.acknowledgement_no}:{layer}:{acct}"
             existing = _step_get(s, p, "BQ_TRACE", idem)
             if existing and existing.status == "SUCCESS":
@@ -440,7 +507,7 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
                 collected.append(_to_mha_txn(row, layer=layer))
                 recovered += _row_amount(row)
                 nxt = row.get(config.BQ_FIELD_BENE_ACCOUNT)
-                if nxt:
+                if nxt and str(nxt) not in seen_accounts:
                     next_frontier.append(str(nxt))
         frontier = next_frontier
         layer += 1
@@ -522,12 +589,42 @@ def _hold_txns(s: Session, p: ComplaintProcessing) -> list[dict]:
     return out
 
 
+def _dd_txn_entries(s: Session, p: ComplaintProcessing) -> list[dict]:
+    """Transaction-enquiry matches (one per incident found by RRN), shaped for
+    the MHA response. Narratives carry the beneficiary chain — exact field
+    parsing (which narrative is bene acct vs IFSC) depends on HSBC's spec."""
+    rows = s.execute(
+        select(ProcessingStep).where(
+            ProcessingStep.complaint_id == p.complaint_id,
+            ProcessingStep.step == "DD_TXN",
+            ProcessingStep.status == "SUCCESS",
+        )
+    ).scalars().all()
+    out = []
+    for r in rows:
+        rp = r.response_payload or {}
+        if not rp.get("found"):
+            continue
+        txn = rp.get("matched") or {}
+        out.append({
+            "txn_type": "Transaction Details",
+            "rrn_transaction_id": (r.request_payload or {}).get("rrn"),
+            "amount": _dig(txn, "transactionAmount.amount"),
+            "currency": _dig(txn, "transactionAmount.currency"),
+            "post_date": txn.get("postDate"),
+            "post_status": txn.get("postStatusDescription"),
+            "narratives": _narratives(txn),
+            "status_code": "00",
+        })
+    return out
+
+
 def _finalize(s: Session, p: ComplaintProcessing, instrument: Instrument,
               incidents: list[Incident], traced_txns: list[dict]) -> None:
     payload = {
         "acknowledgement_no": p.acknowledgement_no,
         "job_id": p.job_id,
-        "transactions": _hold_txns(s, p) + traced_txns,
+        "transactions": _hold_txns(s, p) + _dd_txn_entries(s, p) + traced_txns,
     }
     _write_response_log(s, p, payload)
 

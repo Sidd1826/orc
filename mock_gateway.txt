@@ -1,36 +1,81 @@
 """
 mock_gateway.py — a fake HSBC MHA Gateway for LOCAL testing only.
 
-Mirrors the 5 endpoints the orchestrator calls and returns canned responses,
-so you can exercise the whole state machine without any HSBC connectivity.
+Returns the REAL response shapes you provided:
+  - demand-deposit / balance enquiry -> accounts[].currentBalance.amount
+  - transaction enquiry -> accountInformation.transactionDetails[] with
+    transactionDescription[].transactionNarrative (RRN appears as a narrative)
 
-Run:
-    uvicorn mock_gateway:app --host 0.0.0.0 --port 8000
+Behaviour is derived from the ACCOUNT NUMBER so one mock + one seed exercises
+every path:
+  BALANCES[account]       -> currentBalance returned by the balance enquiry
+  ACCOUNT_TRACE[account]  -> amount recovered by the FIRST BigQuery search
+Anything not listed falls back to env defaults.
 
-Knobs (env):
-    MOCK_AVAILABLE_BALANCE   default "100000.00"
-        - high  -> balance >= disputed -> full hold -> RESOLVED (no trace)
-        - low   -> balance <  disputed -> partial hold -> BigQuery trace path
-    MOCK_TRACE_AMOUNT        default "1000.00" (amount on each returned BQ row;
-                             large so the trace reconciles in one layer)
+Run:  uvicorn mock_gateway:app --host 0.0.0.0 --port 8000
 """
 from __future__ import annotations
 
 import os
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import Body, FastAPI
 
 app = FastAPI(title="MOCK HSBC MHA Gateway")
 
+BALANCES: dict[str, str] = {
+    "ACC-PART-0001": "20.00",
+    "ACC-PART-0002": "20.00",
+    "ACC-ZERO-0001": "0.00",
+}
+DEFAULT_BALANCE = os.getenv("MOCK_AVAILABLE_BALANCE", "100000.00")
 
-def _balance() -> str:
-    return os.getenv("MOCK_AVAILABLE_BALANCE", "100000.00")
+ACCOUNT_TRACE: dict[str, float] = {
+    "ACC-PART-0001": 1000.00,
+    "ACC-PART-0002": 5.00,
+    "ACC-ZERO-0001": 1000.00,
+}
+DEFAULT_TRACE = float(os.getenv("MOCK_TRACE_AMOUNT", "0") or 0)
+
+TERMINAL_PAYEE = "00000033082900137"
+BQ_FIELD_ACCOUNT = "OGBEAC"
+
+# RRNs the transaction enquiry "knows about" (the seed_tests incidents that go
+# through transaction enquiry, i.e. recent + not UPI-debit). Each is returned
+# as a narrative so the orchestrator's RRN match succeeds.
+KNOWN_RRNS = [
+    "244444440001", "244444440002a", "244444440002b", "244444440004",
+    "244444440005", "244444440006", "244444440007", "244444440009",
+]
 
 
-def _trace_amount() -> str:
-    return os.getenv("MOCK_TRACE_AMOUNT", "1000.00")
+def _real_account_from_dd(body: Any) -> Optional[str]:
+    try:
+        return body["sensitiveData"][0]["value"]
+    except Exception:
+        return None
+
+
+def _txn(rrn: str) -> dict:
+    return {
+        "captureUserId": "1@11",
+        "postDate": "2026-06-01",
+        "postStatusDescription": "APPROVED",
+        "systemCode": "DD",
+        "transactionAmount": {"amount": "-35.00", "currency": "INR"},
+        "transactionCode": "10200",
+        "transactionDescription": [
+            {"transactionNarrative": "IMPS"},
+            {"transactionNarrative": rrn},
+            {"transactionNarrative": ""},
+            {"transactionNarrative": "Test"},
+            {"transactionNarrative": rrn},
+            {"transactionNarrative": "500021738001/90392620000/9494949494"},
+            {"transactionNarrative": "HDFC/500021522001"},
+            {"transactionNarrative": "IMPS"},
+        ],
+    }
 
 
 @app.get("/health")
@@ -40,71 +85,60 @@ async def health():
 
 @app.get("/api/v1/accounts/demand-deposit")
 async def demand_deposit(hubCustomerNumber: str = "", body: Any = Body(default=None)):
+    account = _real_account_from_dd(body)
+    bal = BALANCES.get(account, DEFAULT_BALANCE) if account else DEFAULT_BALANCE
+    # Real balance-enquiry shape. NOTE availableBalance is intentionally 0 so a
+    # bug that reads availableBalance instead of currentBalance would show up.
     return {
-        "requestId": str(uuid.uuid4()),
-        "data": {
-            "availableBalance": _balance(),
-            "currentBalance": _balance(),
-            "currencyCode": "INR",
-            "beneficiary": {"name": "MOCK BENE", "account": "00000033082900137"},
-        },
+        "transactionReferenceNumber": "",
+        "accounts": [{
+            "customerNumber": "INHSBC003297637",
+            "accountNumber": account or "INHSBC003297637006",
+            "accountStatusDesc": "ACTIVE",
+            "currentBalance": {"currencyCode": "INR", "amount": bal},
+            "availableBalance": {"currencyCode": "INR", "amount": 0.000},
+            "_mock_account_seen": account,
+        }],
     }
 
 
 @app.get("/api/v1/transactions/history")
-async def transaction_history(accountNumber: str = "", body: Any = Body(default=None)):
+async def transaction_history(accountNumber: str = "", fromDate: str = "",
+                              body: Any = Body(default=None)):
     return {
-        "requestId": str(uuid.uuid4()),
-        "data": {"transactions": [
-            {"rrn": "244444444444", "amount": "35.00", "type": "DEBIT"},
-        ]},
+        "accountInformation": {
+            "accountCurrencyCode": "INR",
+            "accountNumber": "INHSBC500021738001",
+            "moreTxns": "N",
+            "transactionDetails": [_txn(r) for r in KNOWN_RRNS],
+        }
     }
 
 
 @app.post("/api/v1/accounts/apply-hold")
 async def apply_hold(body: dict = Body(...)):
-    details = body.get("applyHoldDetails", {})
-    return {
-        "requestId": str(uuid.uuid4()),
-        "data": {
-            "status": "SUCCESS",
-            "holdReference": f"HOLD-{uuid.uuid4().hex[:10]}",
-            "heldAmount": details.get("holdAmount"),
-            "accountNumber": details.get("accountNumber"),
-        },
-    }
+    d = body.get("applyHoldDetails", {})
+    return {"requestId": str(uuid.uuid4()),
+            "data": {"status": "SUCCESS", "holdReference": f"HOLD-{uuid.uuid4().hex[:10]}",
+                     "heldAmount": d.get("holdAmount"), "accountNumber": d.get("accountNumber"),
+                     "holdType": d.get("holdType"), "holdNarrative2": d.get("holdNarrative2")}}
 
 
 @app.post("/api/v1/upi/secure")
 async def upi_secure(payload: dict = Body(...)):
-    return {
-        "requestId": str(uuid.uuid4()),
-        "data": {
-            "rrn": payload.get("rrn"),
-            "beneficiaryName": "MOCK UPI BENE",
-            "beneficiaryAccount": "00000033082900137",
-            "ifsc": "SBIN0000625",
-            "bankName": "SBI",
-        },
-    }
+    return {"requestId": str(uuid.uuid4()),
+            "data": {"rrn": payload.get("rrn"), "beneficiaryName": "MOCK UPI BENE",
+                     "beneficiaryAccount": TERMINAL_PAYEE, "ifsc": "SBIN0000625", "bankName": "SBI"}}
 
 
 @app.post("/api/v1/search")
 async def search(body: dict = Body(...)):
-    # Return one outgoing-payment row shaped with the OG* whitelist fields the
-    # orchestrator reads. Amount is large so the money-trace reconciles fast.
+    account = body.get(BQ_FIELD_ACCOUNT)
+    amount = ACCOUNT_TRACE.get(account, DEFAULT_TRACE) if account else DEFAULT_TRACE
+    if not amount:
+        return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": 0, "rows": []}
     row = {
-        "OGTRNO": "244444444444",
-        "OGBEAC": "00000033082900137",
-        "OGBEA1": "MOCK PAYEE",
-        "OGPYAM": float(_trace_amount()),
-        "OGCPDT": 20260601,
-        "OGCPTM": 150200,
-        "OGPYCY": "INR",
+        "OGTRNO": "244444444444", "OGBEAC": TERMINAL_PAYEE, "OGBEA1": "MOCK PAYEE",
+        "OGPYAM": float(amount), "OGCPDT": 20260601, "OGCPTM": 150200, "OGPYCY": "INR",
     }
-    return {
-        "requestId": str(uuid.uuid4()),
-        "filters_used": body,
-        "row_count": 1,
-        "rows": [row],
-    }
+    return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": 1, "rows": [row]}

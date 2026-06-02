@@ -124,16 +124,19 @@ class GatewayClient:
 
     # ------------------------------------------------------------------
     # Apply hold. Caller MUST guard idempotency (see processor).
+    # Mandatory fields per HSBC: accountNumber, holdType, holdTillExpiredDate,
+    # holdCurrency, holdAmount, holdNarrative2.
     # ------------------------------------------------------------------
     def apply_hold(self, *, account_number: str, currency: str, amount: str,
-                   hold_type: str = "B", hold_till: str = "2099-12-31") -> dict[str, Any]:
+                   hold_type: str, hold_till: str, hold_narrative2: str) -> dict[str, Any]:
         body = {"applyHoldDetails": {
             "accountNumber":       account_number,
             "accountCurrencyCode": currency,
-            "holdTillExpiredDate": hold_till,
             "holdType":            hold_type,
+            "holdTillExpiredDate": hold_till,
             "holdCurrency":        currency,
             "holdAmount":          amount,
+            "holdNarrative2":      hold_narrative2,
         }}
         return self._request("POST", "/api/v1/accounts/apply-hold", json_body=body)
 
