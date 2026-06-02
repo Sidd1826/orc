@@ -1,30 +1,27 @@
 """
-models.py — SQLAlchemy 2.0 models matching schema.sql + migration.sql.
+models.py — SQLAlchemy ORM mapped to your schema.txt.
 
-We use string columns for status fields (not SQLAlchemy Enums) because the
-worker only writes a subset of values and pinning them to Postgres enums
-would mean a migration every time we add a state. The Python `Status` class
-below is the source of truth for valid values.
+Tables already exist in the DB (created from schema.sql), so we never call
+create_all(). GENERATED columns are marked Computed() so they're excluded
+from INSERTs. PG ENUM columns are mapped as String — the DB still enforces
+the enum constraint; we just don't redeclare the type here.
+
+ADDITIONS to your schema (see migrations.sql) — needed for the polling state
+machine and idempotent holds:
+  complaints: processing_state, job_id, attempt_count, lease_expires_at, last_error
+  new table:  processing_steps  (per-call audit + idempotency keys)
 """
 from __future__ import annotations
 
 from datetime import date, datetime, time
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Optional
 
 from sqlalchemy import (
-    BigInteger,
-    Date,
-    DateTime,
-    ForeignKey,
-    Integer,
-    Numeric,
-    SmallInteger,
-    String,
-    Text,
-    Time,
+    BigInteger, Computed, Date, DateTime, ForeignKey, Integer,
+    Numeric, String, Text, Time, func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ENUM, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -32,155 +29,168 @@ class Base(DeclarativeBase):
     pass
 
 
-# ---------------------------------------------------------------------------
-# Status constants — single source of truth.
-# Stored as VARCHAR(20) in the DB, so adding a new one is code-only.
-# ---------------------------------------------------------------------------
-
-class ComplaintStatus:
-    OPEN                  = "OPEN"
-    PROCESSING            = "PROCESSING"
-    BALANCE_FETCHED       = "BALANCE_FETCHED"
-    HOLD_APPLIED_FULL     = "HOLD_APPLIED_FULL"
-    HOLD_APPLIED_PARTIAL  = "HOLD_APPLIED_PARTIAL"
-    TRACING               = "TRACING"
-    TRACE_COMPLETE        = "TRACE_COMPLETE"
-    RESPONSE_READY        = "RESPONSE_READY"
-    RESOLVED              = "RESOLVED"
-    FAILED_RETRYABLE      = "FAILED_RETRYABLE"
-    FAILED_TERMINAL       = "FAILED_TERMINAL"
-    MANUAL_REVIEW         = "MANUAL_REVIEW"
-
-
-# Statuses the sweep is allowed to claim.
-CLAIMABLE_STATUSES = (
-    ComplaintStatus.OPEN,
-    ComplaintStatus.FAILED_RETRYABLE,
+# Native PG enum types (already created in the DB; create_type=False so
+# SQLAlchemy maps to them without trying to CREATE TYPE or cast to VARCHAR).
+PaymentMode = ENUM(
+    "Credit", "Debit", "UPI", "NEFT", "RTGS", "IMPS",
+    name="payment_mode", create_type=False,
 )
-
-# Terminal statuses — sweep ignores these.
-TERMINAL_STATUSES = (
-    ComplaintStatus.RESOLVED,
-    ComplaintStatus.FAILED_TERMINAL,
-    ComplaintStatus.MANUAL_REVIEW,
+TransactionType = ENUM(
+    "P2P", "P2M", "Collect", "Refund", "Unknown",
+    name="transaction_type", create_type=False,
+)
+FraudSubCategory = ENUM(
+    "UPI Related Frauds", "Card Fraud", "Net Banking Fraud", "Wallet Fraud", "Other",
+    name="fraud_sub_category", create_type=False,
+)
+ApiResponseStatus = ENUM(
+    "SUCCESS", "FAILURE", "PENDING", "TIMEOUT",
+    name="api_response_status", create_type=False,
 )
 
 
-class ApiResponseStatus:
-    SUCCESS = "SUCCESS"
-    FAILURE = "FAILURE"
-    PENDING = "PENDING"
-    TIMEOUT = "TIMEOUT"
+# Coarse external status
+STATUS_OPEN        = "OPEN"
+STATUS_IN_PROGRESS = "IN_PROGRESS"
+STATUS_RESOLVED    = "RESOLVED"
+STATUS_REVIEW      = "NEEDS_REVIEW"
 
+# Fine-grained processing state machine
+ST_RECEIVED        = "RECEIVED"
+ST_CLASSIFIED      = "CLASSIFIED"
+ST_ENRICHED        = "ENRICHED"
+ST_BALANCE_CHECKED = "BALANCE_CHECKED"
+ST_HOLD_APPLIED    = "HOLD_APPLIED"
+ST_RECONCILING     = "RECONCILING"
+ST_RESOLVED        = "RESOLVED"
+ST_NEEDS_REVIEW    = "NEEDS_REVIEW"
 
-# ---------------------------------------------------------------------------
-# Tables
-# ---------------------------------------------------------------------------
+TERMINAL_STATES = {ST_RESOLVED, ST_NEEDS_REVIEW}
+
 
 class Complaint(Base):
+    """EXACTLY schema.txt — shared with the other service. DO NOT add columns.
+    Treated read-only by this service (we never write to it)."""
     __tablename__ = "complaints"
 
-    id:                 Mapped[int]      = mapped_column(BigInteger, primary_key=True)
-    acknowledgement_no: Mapped[str]      = mapped_column(String(20), unique=True, nullable=False)
-    sub_category:       Mapped[str]      = mapped_column(String, nullable=False)
-    status:             Mapped[str]      = mapped_column(String(20), nullable=False, default=ComplaintStatus.OPEN)
-    created_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    acknowledgement_no: Mapped[str] = mapped_column(String(20), unique=True)
+    sub_category: Mapped[str] = mapped_column(FraudSubCategory)
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_OPEN)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    # Worker bookkeeping (added by migration.sql)
-    attempt_count:      Mapped[int]                = mapped_column(Integer, nullable=False, default=0)
-    last_error:         Mapped[Optional[str]]      = mapped_column(Text, nullable=True)
-    locked_at:          Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    instrument: Mapped["Instrument"] = relationship(
+        back_populates="complaint", uselist=False, cascade="all, delete-orphan"
+    )
+    # 1:1 to our own state table (NOT part of schema.txt).
+    processing: Mapped[Optional["ComplaintProcessing"]] = relationship(
+        back_populates="complaint", uselist=False, cascade="all, delete-orphan"
+    )
 
-    instrument: Mapped["Instrument"] = relationship(back_populates="complaint", uselist=False)
+
+class ComplaintProcessing(Base):
+    """Sidecar state owned ENTIRELY by this orchestrator (orchestrator_tables.sql).
+    Keeps all processing state OUT of the shared `complaints` table so the other
+    service's schema is untouched. One row per complaint."""
+    __tablename__ = "complaint_processing"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    complaint_id: Mapped[int] = mapped_column(
+        ForeignKey("complaints.id", ondelete="CASCADE"), unique=True)
+    acknowledgement_no: Mapped[str] = mapped_column(String(20))   # denormalized
+
+    processing_state: Mapped[str] = mapped_column(String(30), default=ST_RECEIVED)
+    job_id: Mapped[Optional[str]] = mapped_column(String(60))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    complaint: Mapped["Complaint"] = relationship(back_populates="processing")
 
 
 class Instrument(Base):
     __tablename__ = "instruments"
 
-    id:                   Mapped[int]      = mapped_column(BigInteger, primary_key=True)
-    complaint_id:         Mapped[int]      = mapped_column(ForeignKey("complaints.id", ondelete="CASCADE"), nullable=False, unique=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    complaint_id: Mapped[int] = mapped_column(ForeignKey("complaints.id", ondelete="CASCADE"))
 
-    requestor:            Mapped[str]      = mapped_column(String(50), nullable=False)
-    payer_bank:           Mapped[str]      = mapped_column(String(100), nullable=False)
-    payer_bank_code:      Mapped[str]      = mapped_column(String(10), nullable=False)
+    requestor: Mapped[str] = mapped_column(String(50))
+    payer_bank: Mapped[str] = mapped_column(String(100))
+    payer_bank_code: Mapped[str] = mapped_column(String(10))
+    mode_of_payment: Mapped[str] = mapped_column(PaymentMode)
+    transaction_type: Mapped[str] = mapped_column(TransactionType, default="Unknown")
+    wallet: Mapped[Optional[str]] = mapped_column(String(50))
+    payer_mobile_number: Mapped[str] = mapped_column(String(15))
+    payer_account_number: Mapped[str] = mapped_column(String(30))
+    state: Mapped[Optional[str]] = mapped_column(String(60))
+    district: Mapped[Optional[str]] = mapped_column(String(60))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    mode_of_payment:      Mapped[str]      = mapped_column(String, nullable=False)
-    transaction_type:     Mapped[str]      = mapped_column(String, nullable=False, default="Unknown")
-    wallet:               Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-
-    payer_mobile_number:  Mapped[str]      = mapped_column(String(15), nullable=False)
-    payer_account_number: Mapped[str]      = mapped_column(String(30), nullable=False)
-
-    state:                Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
-    district:             Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
-
-    created_at:           Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at:           Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-    complaint: Mapped[Complaint]            = relationship(back_populates="instrument")
-    incidents: Mapped[list["Incident"]]     = relationship(back_populates="instrument")
+    complaint: Mapped["Complaint"] = relationship(back_populates="instrument")
+    incidents: Mapped[list["Incident"]] = relationship(
+        back_populates="instrument", cascade="all, delete-orphan"
+    )
 
 
 class Incident(Base):
     __tablename__ = "incidents"
 
-    id:                 Mapped[int]      = mapped_column(BigInteger, primary_key=True)
-    instrument_id:      Mapped[int]      = mapped_column(ForeignKey("instruments.id", ondelete="CASCADE"), nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    instrument_id: Mapped[int] = mapped_column(ForeignKey("instruments.id", ondelete="CASCADE"))
 
-    merchant_id:        Mapped[str]      = mapped_column(String(30), nullable=False)
-    amount:             Mapped[Decimal]  = mapped_column(Numeric(12, 2), nullable=False)
-    disputed_amount:    Mapped[Decimal]  = mapped_column(Numeric(12, 2), nullable=False)
-    layer:              Mapped[int]      = mapped_column(SmallInteger, nullable=False, default=0)
-
-    transaction_date:   Mapped[date]     = mapped_column(Date, nullable=False)
-    transaction_time:   Mapped[time]     = mapped_column(Time, nullable=False)
-    # transaction_at is a Postgres GENERATED column:
-    #   (transaction_date + transaction_time) AT TIME ZONE 'Asia/Kolkata'
-    # We mark it read-only with server_default + don't write to it.
-    transaction_at:     Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True,
-        server_default=None,
+    merchant_id: Mapped[str] = mapped_column(String(30))         # the MHA "m" field == RRN
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    disputed_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    layer: Mapped[int] = mapped_column(Integer, default=0)
+    transaction_date: Mapped[date] = mapped_column(Date)
+    transaction_time: Mapped[time] = mapped_column(Time)
+    transaction_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        Computed("(transaction_date + transaction_time) AT TIME ZONE 'Asia/Kolkata'", persisted=True),
     )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    created_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-    instrument: Mapped[Instrument] = relationship(back_populates="incidents")
+    instrument: Mapped["Instrument"] = relationship(back_populates="incidents")
 
 
 class ApiResponseLog(Base):
+    """Final collated response sent back to MHA — one row per job."""
     __tablename__ = "api_response_logs"
 
-    id:                  Mapped[int]                = mapped_column(BigInteger, primary_key=True)
-    complaint_id:        Mapped[Optional[int]]      = mapped_column(ForeignKey("complaints.id", ondelete="SET NULL"), nullable=True)
-    acknowledgement_no:  Mapped[str]                = mapped_column(String(20), nullable=False)
-    job_id:              Mapped[str]                = mapped_column(String(60), nullable=False)
-
-    response_code:       Mapped[str]                = mapped_column(String(10), nullable=False)
-    response_message:    Mapped[str]                = mapped_column(String, nullable=False, default=ApiResponseStatus.SUCCESS)
-    response_payload:    Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
-    # NOTE: is_success is a Postgres GENERATED column (response_code = '00'),
-    # so we don't map it for writes. The orchestrator sets response_code='00'
-    # on success and a non-'00' string on failure.
-
-    requested_at:        Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False)
-    responded_at:        Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    # response_latency_ms is also a GENERATED column — don't map it.
-
-    created_at:          Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at:          Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    complaint_id: Mapped[Optional[int]] = mapped_column(ForeignKey("complaints.id", ondelete="SET NULL"))
+    acknowledgement_no: Mapped[str] = mapped_column(String(20))
+    job_id: Mapped[str] = mapped_column(String(60), unique=True)
+    response_code: Mapped[str] = mapped_column(String(10))       # "00" = success
+    response_message: Mapped[str] = mapped_column(ApiResponseStatus, default="SUCCESS")
+    response_payload: Mapped[Optional[dict]] = mapped_column(JSONB)
+    is_success: Mapped[bool] = mapped_column(Computed("response_code = '00'", persisted=True))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    responded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class ComplaintResponse(Base):
-    """The final per-complaint JSON the sender service picks up."""
-    __tablename__ = "complaint_responses"
+class ProcessingStep(Base):
+    """Per-external-call audit + idempotency. NOT in your original schema —
+    see migrations.sql. The unique idempotency_key is what makes the
+    apply-hold call safe to retry without double-holding funds."""
+    __tablename__ = "processing_steps"
 
-    id:                 Mapped[int]                = mapped_column(BigInteger, primary_key=True)
-    complaint_id:       Mapped[int]                = mapped_column(ForeignKey("complaints.id", ondelete="CASCADE"), nullable=False, unique=True)
-    acknowledgement_no: Mapped[str]                = mapped_column(String(20), nullable=False)
-    response_json:      Mapped[dict[str, Any]]     = mapped_column(JSONB, nullable=False)
-    status:             Mapped[str]                = mapped_column(String, nullable=False, default="READY")
-    created_at:         Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False)
-    sent_at:            Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    sender_attempts:    Mapped[int]                = mapped_column(Integer, nullable=False, default=0)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    complaint_id: Mapped[int] = mapped_column(ForeignKey("complaints.id", ondelete="CASCADE"))
+    acknowledgement_no: Mapped[str] = mapped_column(String(20))
+    job_id: Mapped[Optional[str]] = mapped_column(String(60))
+    step: Mapped[str] = mapped_column(String(40))               # DD_ENQUIRY | HOLD | BQ_TRACE | UPI_BENE
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(200), unique=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")  # PENDING|SUCCESS|FAILURE
+    request_payload: Mapped[Optional[dict]] = mapped_column(JSONB)
+    response_payload: Mapped[Optional[dict]] = mapped_column(JSONB)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

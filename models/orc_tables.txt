@@ -1,0 +1,46 @@
+-- =============================================================================
+-- orchestrator_tables.sql — tables OWNED BY THIS SERVICE ONLY.
+-- ZERO changes to the shared schema.txt tables (complaints / instruments /
+-- incidents / api_response_logs). Safe to run alongside the other service.
+--   psql "postgresql://USER:PASS@HOST:5432/DB" -f orchestrator_tables.sql
+-- =============================================================================
+
+-- 1) Sidecar processing state (1 row per complaint) ---------------------------
+CREATE TABLE IF NOT EXISTS complaint_processing (
+    id                  BIGSERIAL PRIMARY KEY,
+    complaint_id        BIGINT      NOT NULL UNIQUE
+                                    REFERENCES complaints(id) ON DELETE CASCADE,
+    acknowledgement_no  VARCHAR(20) NOT NULL,
+    processing_state    VARCHAR(30) NOT NULL DEFAULT 'RECEIVED',
+    job_id              VARCHAR(60),
+    attempt_count       INT         NOT NULL DEFAULT 0,
+    lease_expires_at    TIMESTAMPTZ,
+    last_error          TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- The poller's hot query: non-terminal, lease-free rows, oldest first.
+CREATE INDEX IF NOT EXISTS idx_cp_poll
+    ON complaint_processing (processing_state, lease_expires_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_cp_ack ON complaint_processing(acknowledgement_no);
+
+-- 2) Per-external-call audit + idempotency ------------------------------------
+CREATE TABLE IF NOT EXISTS processing_steps (
+    id                  BIGSERIAL PRIMARY KEY,
+    complaint_id        BIGINT      REFERENCES complaints(id) ON DELETE CASCADE,
+    acknowledgement_no  VARCHAR(20) NOT NULL,
+    job_id              VARCHAR(60),
+    step                VARCHAR(40) NOT NULL,           -- DD_ENQUIRY | HOLD | BQ_TRACE | UPI_BENE | STASH_*
+    idempotency_key     VARCHAR(200) UNIQUE,            -- the double-hold guard
+    status              VARCHAR(20) NOT NULL DEFAULT 'PENDING',  -- PENDING|SUCCESS|FAILURE
+    request_payload     JSONB,
+    response_payload    JSONB,
+    attempt             INT         NOT NULL DEFAULT 1,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_steps_complaint ON processing_steps(complaint_id);
+CREATE INDEX IF NOT EXISTS idx_steps_ack       ON processing_steps(acknowledgement_no);
+CREATE INDEX IF NOT EXISTS idx_steps_step      ON processing_steps(step);

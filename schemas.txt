@@ -1,0 +1,58 @@
+"""
+schemas.py — Pydantic models for the inbound MHA payload and API responses.
+
+The MHA sample JSON uses inconsistent keys (spaces, typos). We canonicalise to
+snake_case and accept the spaced variants via AliasChoices so ingestion is
+tolerant of the vendor's formatting.
+"""
+from __future__ import annotations
+
+from datetime import date, time
+from decimal import Decimal
+from typing import Optional
+
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+
+
+class IncidentIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    amount: Decimal
+    merchant_id: str = Field(validation_alias=AliasChoices("m", "merchant_id"))
+    transaction_date: date = Field(validation_alias=AliasChoices("transaction_date", "transaction date"))
+    transaction_time: time = Field(validation_alias=AliasChoices("transaction_time", "transaction time"))
+    disputed_amount: Decimal = Field(validation_alias=AliasChoices("disputed_amount", "disputed amount"))
+    layer: int = 0
+
+
+class InstrumentIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    requestor: str
+    payer_bank: str = Field(validation_alias=AliasChoices("payer_bank", "payer bank"))
+    payer_bank_code: str = Field(validation_alias=AliasChoices("payer_bank_code", "payer bank code"))
+    mode_of_payment: str = Field(validation_alias=AliasChoices("mode_of_payment", "mode of payment"))
+    transaction_type: str = Field(
+        default="Unknown",
+        validation_alias=AliasChoices("transaction_type", "transaction type"),
+    )
+    wallet: Optional[str] = None
+    payer_mobile_number: str = Field(validation_alias=AliasChoices("payer_mobile_number", "payer mobile number"))
+    payer_account_number: str = Field(validation_alias=AliasChoices("payer_account_number", "payer account number"))
+    state: Optional[str] = None
+    district: Optional[str] = None
+    incidents: list[IncidentIn] = Field(default_factory=list)
+
+
+class ComplaintIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    acknowledgement_no: str = Field(validation_alias=AliasChoices("acknowledgement_no", "acknowledgement no"))
+    sub_category: str = Field(validation_alias=AliasChoices("sub_category", "sub category"))
+    instrument: InstrumentIn
+
+
+class IngestAck(BaseModel):
+    acknowledgement_no: str
+    job_id: str
+    status: str

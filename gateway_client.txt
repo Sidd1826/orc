@@ -1,19 +1,18 @@
 """
-gateway_client.py — Sync httpx client for the sibling HSBC MHA Gateway.
+gateway_client.py — sync client for the upstream HSBC MHA Gateway (the Cloud
+Run service whose files you shared). One process-wide httpx.Client.
 
-Wraps the four endpoints we need:
+Service-to-service auth: if USE_OIDC_AUTH is true, we mint a Google-signed
+OIDC identity token for GATEWAY_AUDIENCE on each call (cached until ~expiry by
+google-auth). This is the standard way one Cloud Run calls another private one.
 
-  * GET  /api/v1/transactions/history
-  * POST /api/v1/accounts/apply-hold
-  * GET  /api/v1/accounts/demand-deposit
-  * POST /api/v1/search                  (BigQuery filtered search)
-
-Auth: Cloud-Run-to-Cloud-Run identity tokens via google-auth (toggleable).
-Sync because pg8000 is sync; main.py offloads everything to a thread pool.
+Sensitive-data tokenisation: the gateway expects an opaque key in the
+accountNumber / hubCustomerNumber query param and the real HSBC account in the
+X-HSBC-Sensitive-Data body, shaped [{"key": <token>, "value": <real account>}].
 """
 from __future__ import annotations
 
-import json
+import uuid
 from typing import Any, Optional
 
 import httpx
@@ -24,214 +23,138 @@ from logger import get_logger
 log = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
 class GatewayError(Exception):
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int = 502,
-        upstream_status: Optional[int] = None,
-        upstream_body: Any = None,
-    ):
+    def __init__(self, message: str, *, status_code: int = 502, body: Any = None):
         super().__init__(message)
         self.status_code = status_code
-        self.upstream_status = upstream_status
-        self.upstream_body = upstream_body
+        self.body = body
 
 
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
+def _oidc_token() -> Optional[str]:
+    if not config.USE_OIDC_AUTH:
+        return None
+    # Imported lazily so local/test runs without GCP creds still import fine.
+    from google.auth.transport.requests import Request as GoogleRequest
+    from google.oauth2 import id_token
+    try:
+        return id_token.fetch_id_token(GoogleRequest(), config.GATEWAY_AUDIENCE)
+    except Exception as e:  # pragma: no cover
+        raise GatewayError(f"Failed to mint OIDC token: {e}") from e
+
+
+def _sensitive(real_account: str) -> tuple[str, list[dict[str, str]]]:
+    """Return (token_for_query_param, sensitive_data_body)."""
+    token = f"k{uuid.uuid4().hex[:12]}"
+    return token, [{"key": token, "value": real_account}]
+
 
 class GatewayClient:
-    """Sync wrapper around the gateway service."""
-
-    def __init__(self, http: httpx.Client) -> None:
-        if not config.GATEWAY_BASE_URL:
-            raise RuntimeError("GATEWAY_BASE_URL is not set")
-        self._http = http
-        self._base = config.GATEWAY_BASE_URL.rstrip("/")
-        self._use_iam = config.GATEWAY_USE_IAM_AUTH
-        log.info(
-            "GatewayClient ready | base=%s iam_auth=%s",
-            self._base, self._use_iam,
+    def __init__(self) -> None:
+        self._http = httpx.Client(
+            base_url=config.GATEWAY_BASE_URL.rstrip("/"),
+            timeout=httpx.Timeout(
+                connect=config.GATEWAY_TIMEOUT_CONNECT,
+                read=config.GATEWAY_TIMEOUT_READ,
+                write=config.GATEWAY_TIMEOUT_READ,
+                pool=config.GATEWAY_TIMEOUT_CONNECT,
+            ),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
+        log.info("GatewayClient ready | base=%s oidc=%s",
+                 config.GATEWAY_BASE_URL, config.USE_OIDC_AUTH)
+
+    def close(self) -> None:
+        self._http.close()
 
     # ------------------------------------------------------------------
-    # Auth
-    # ------------------------------------------------------------------
+    def _request(self, method: str, path: str, *,
+                 params: Optional[dict] = None,
+                 json_body: Optional[Any] = None) -> dict[str, Any]:
+        headers = {"Accept": "application/json"}
+        tok = _oidc_token()
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
 
-    def _get_id_token(self) -> Optional[str]:
-        """Fetch an ID token for Cloud Run service-to-service auth."""
-        if not self._use_iam:
-            return None
-        import google.auth.transport.requests
-        import google.oauth2.id_token
-
-        auth_req = google.auth.transport.requests.Request()
-        token = google.oauth2.id_token.fetch_id_token(auth_req, self._base)
-        return token
-
-    def _auth_headers(self) -> dict[str, str]:
-        token = self._get_id_token()
-        return {"Authorization": f"Bearer {token}"} if token else {}
-
-    # ------------------------------------------------------------------
-    # Core dispatch
-    # ------------------------------------------------------------------
-
-    def _do(
-        self,
-        *,
-        method: str,
-        path: str,
-        op: str,
-        params:    Optional[dict[str, Any]] = None,
-        json_body: Optional[dict[str, Any]] = None,
-        content:   Optional[bytes]          = None,
-        headers:   Optional[dict[str, str]] = None,
-    ) -> dict[str, Any]:
-        url = f"{self._base}{path}"
-        hdrs = {"Accept": "application/json", **self._auth_headers()}
-        if json_body is not None or content is not None:
-            hdrs["Content-Type"] = "application/json"
-        if headers:
-            hdrs.update(headers)
-
-        log.info("Gateway -> %s %s (op=%s)", method, path, op)
+        log.info("GW -> %s %s params=%s", method, path, list((params or {}).keys()))
         try:
-            resp = self._http.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_body if content is None else None,
-                content=content,
-                headers=hdrs,
-            )
+            resp = self._http.request(method, path, params=params, json=json_body, headers=headers)
         except httpx.HTTPError as e:
-            log.error("Gateway %s network error: %s", op, e)
-            raise GatewayError(
-                f"Gateway network error: {type(e).__name__}",
-                status_code=502,
-            ) from e
-
-        log.info("Gateway <- %s status=%d", op, resp.status_code)
+            raise GatewayError(f"Gateway network error: {type(e).__name__}: {e}") from e
 
         try:
             data = resp.json()
         except ValueError:
             data = {"raw": resp.text}
 
-        if resp.status_code >= 400:
-            log.error("Gateway %s error body: %s", op, resp.text[:2000])
+        log.info("GW <- %s %s status=%d", method, path, resp.status_code)
+        if not resp.is_success:
             raise GatewayError(
-                f"Gateway {op} returned {resp.status_code}",
-                status_code=resp.status_code,
-                upstream_status=resp.status_code,
-                upstream_body=data,
+                f"Gateway {path} returned {resp.status_code}",
+                status_code=resp.status_code, body=data,
             )
         return data
 
     # ------------------------------------------------------------------
-    # Endpoint #1 — Transaction history (GET with body)
+    # Demand-deposit enquiry — returns account details + AVAILABLE BALANCE.
     # ------------------------------------------------------------------
+    def demand_deposit(self, real_account: str) -> dict[str, Any]:
+        token, sensitive = _sensitive(real_account)
+        return self._request(
+            "GET", "/api/v1/accounts/demand-deposit",
+            params={"hubCustomerNumber": token},
+            json_body={"sensitiveData": sensitive},
+        )
 
-    def get_transaction_history(
-        self,
-        *,
-        account_number_token: str,
-        real_account_number:  str,
-        from_date: Optional[str] = None,
-        to_date:   Optional[str] = None,
-    ) -> dict[str, Any]:
-        params: dict[str, Any] = {"accountNumber": account_number_token}
+    # ------------------------------------------------------------------
+    # Transaction history (live, < 24h path).
+    # ------------------------------------------------------------------
+    def transaction_history(self, real_account: str,
+                            from_date: Optional[str] = None,
+                            to_date: Optional[str] = None) -> dict[str, Any]:
+        token, sensitive = _sensitive(real_account)
+        params: dict[str, str] = {"accountNumber": token}
         if from_date:
             params["fromDate"] = from_date
         if to_date:
             params["toDate"] = to_date
-
-        body = {"sensitiveData": [
-            {"key": account_number_token, "value": real_account_number},
-        ]}
-        return self._do(
-            method="GET",
-            path="/api/v1/transactions/history",
-            op="transaction_history",
-            params=params,
-            content=json.dumps(body).encode("utf-8"),
+        return self._request(
+            "GET", "/api/v1/transactions/history",
+            params=params, json_body={"sensitiveData": sensitive},
         )
 
     # ------------------------------------------------------------------
-    # Endpoint #2 — Apply account hold (POST)
+    # Apply hold. Caller MUST guard idempotency (see processor).
     # ------------------------------------------------------------------
+    def apply_hold(self, *, account_number: str, currency: str, amount: str,
+                   hold_type: str = "B", hold_till: str = "2099-12-31") -> dict[str, Any]:
+        body = {"applyHoldDetails": {
+            "accountNumber":       account_number,
+            "accountCurrencyCode": currency,
+            "holdTillExpiredDate": hold_till,
+            "holdType":            hold_type,
+            "holdCurrency":        currency,
+            "holdAmount":          amount,
+        }}
+        return self._request("POST", "/api/v1/accounts/apply-hold", json_body=body)
 
-    def apply_account_hold(
-        self,
-        *,
-        account_number:        str,
-        account_currency_code: str,
-        hold_amount:           str,
-        hold_currency:         str,
-        hold_till_expired_date: str,
-        hold_type:             str = "B",
-    ) -> dict[str, Any]:
-        body = {
-            "applyHoldDetails": {
-                "accountNumber":        account_number,
-                "accountCurrencyCode":  account_currency_code,
-                "holdTillExpiredDate":  hold_till_expired_date,
-                "holdType":             hold_type,
-                "holdCurrency":         hold_currency,
-                "holdAmount":           hold_amount,
-            }
+    # ------------------------------------------------------------------
+    # UPI beneficiary lookup (RRN + account + amount + timestamp).
+    # ------------------------------------------------------------------
+    def upi_bene_lookup(self, *, rrn: str, account_number: str,
+                        amount: str, transaction_timestamp: str) -> dict[str, Any]:
+        # NOTE: exact payload keys depend on the UPI contract — confirm & adjust.
+        payload = {
+            "rrn": rrn,
+            "accountNumber": account_number,
+            "amount": amount,
+            "transactionTimestamp": transaction_timestamp,
         }
-        return self._do(
-            method="POST",
-            path="/api/v1/accounts/apply-hold",
-            op="apply_hold",
-            json_body=body,
-        )
+        return self._request("POST", "/api/v1/upi/secure", json_body=payload)
 
     # ------------------------------------------------------------------
-    # Endpoint #3 — Demand deposit account enquiry (GET with body)
+    # BigQuery (CBDOC) search.
     # ------------------------------------------------------------------
-
-    def get_demand_deposit_account(
-        self,
-        *,
-        hub_customer_token: str,
-        real_account_number: str,
-    ) -> dict[str, Any]:
-        params = {"hubCustomerNumber": hub_customer_token}
-        body = {"sensitiveData": [
-            {"key": hub_customer_token, "value": real_account_number},
-        ]}
-        return self._do(
-            method="GET",
-            path="/api/v1/accounts/demand-deposit",
-            op="demand_deposit",
-            params=params,
-            content=json.dumps(body).encode("utf-8"),
-        )
-
-    # ------------------------------------------------------------------
-    # Endpoint #4 — BigQuery filtered search (POST)
-    # ------------------------------------------------------------------
-
-    def search_bigquery(
-        self,
-        *,
-        filters: dict[str, Any],
-        limit:   int = 100,
-    ) -> dict[str, Any]:
-        body: dict[str, Any] = {**filters, "limit": limit}
-        return self._do(
-            method="POST",
-            path="/api/v1/search",
-            op="bq_search",
-            json_body=body,
-        )
+    def bigquery_search(self, filters: dict[str, Any], limit: int = 100) -> dict[str, Any]:
+        body = dict(filters)
+        body["limit"] = limit
+        return self._request("POST", "/api/v1/search", json_body=body)

@@ -1,0 +1,63 @@
+"""
+classifier.py — turn an instrument + incidents into a routing decision,
+following your scenarios table:
+
+  channel   : UPI | INTERNET_BANKING   (from sub_category / mode_of_payment)
+  direction : DEBIT | CREDIT            (was money debited from, or credited to,
+                                         the HSBC account)
+  is_recent : fraud age < FRAUD_AGE_THRESHOLD_HOURS
+
+These three pick the workflow. The exact source fields are best-guess from the
+sample payload — adjust the keyword checks if MHA sends different values.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+import config
+from logger import get_logger
+from models import Incident, Instrument
+
+log = get_logger(__name__)
+
+CHANNEL_UPI = "UPI"
+CHANNEL_IB  = "INTERNET_BANKING"
+DIR_DEBIT   = "DEBIT"
+DIR_CREDIT  = "CREDIT"
+
+
+@dataclass
+class Classification:
+    channel: str
+    direction: str
+    is_recent: bool
+    fraud_age_hours: float
+
+
+def _earliest_txn_at(incidents: list[Incident]) -> datetime:
+    times = [i.transaction_at for i in incidents if i.transaction_at is not None]
+    return min(times) if times else datetime.now(timezone.utc)
+
+
+def classify(instrument: Instrument, incidents: list[Incident],
+             sub_category: str) -> Classification:
+    sub = (sub_category or "").upper()
+    mode = (instrument.mode_of_payment or "").upper()
+
+    channel = CHANNEL_UPI if ("UPI" in sub or "UPI" in mode) else CHANNEL_IB
+
+    # Direction: "Debit" => debited from HSBC account; "Credit" => credited in.
+    direction = DIR_CREDIT if "CREDIT" in mode else DIR_DEBIT
+
+    txn_at = _earliest_txn_at(incidents)
+    if txn_at.tzinfo is None:
+        txn_at = txn_at.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - txn_at).total_seconds() / 3600.0
+    is_recent = age_hours < config.FRAUD_AGE_THRESHOLD_HOURS
+
+    c = Classification(channel=channel, direction=direction,
+                       is_recent=is_recent, fraud_age_hours=age_hours)
+    log.info("classify -> channel=%s direction=%s recent=%s age=%.1fh",
+             c.channel, c.direction, c.is_recent, c.fraud_age_hours)
+    return c

@@ -3,8 +3,6 @@ uvicorn[standard]==0.34.0
 httpx==0.28.1
 pydantic==2.10.4
 python-dotenv==1.0.1
-sqlalchemy==2.0.36
+SQLAlchemy==2.0.36
 pg8000==1.31.2
-cloud-sql-python-connector[pg8000]==1.15.0
-google-cloud-secret-manager==2.20.2
 google-auth==2.37.0

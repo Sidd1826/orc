@@ -1,215 +1,114 @@
 """
-db.py — Sync SQLAlchemy engine + session factory + claim helper.
+db.py — Postgres connection via pg8000 + SQLAlchemy, using plain
+host / user / password / dbname (the same way you connect in DBeaver).
 
-Connection modes:
-  * Cloud Run: Cloud SQL Python Connector with pg8000 + IAM auth (the
-               team-standard pattern). Triggered by INSTANCE_CONNECTION_NAME
-               being set.
-  * Local:     Plain pg8000 DSN built from DB_HOST/DB_PORT/etc.
+Two ways to point it at a database, in priority order:
 
-pg8000 is a sync driver, so we use a sync SQLAlchemy Engine here. The
-FastAPI handlers offload DB work to a thread pool via asyncio.to_thread()
-— exactly the pattern your gateway uses for the sync `requests` library.
+  1. DATABASE_URL  — a full SQLAlchemy URL, e.g.
+         postgresql+pg8000://user:pass@host:5432/dbname
+     (handy for quick local overrides)
 
-The claim helper uses `SELECT ... FOR UPDATE SKIP LOCKED` so two sweep
-ticks can safely run concurrently without ever grabbing the same row.
+  2. PG_HOST / PG_PORT / PG_USER / PG_PASSWORD / PG_DB
+     - LOCAL / TCP:   PG_HOST=10.20.30.40  (or localhost)
+     - Cloud Run:     PG_HOST=/cloudsql/PROJECT:REGION:INSTANCE
+                      (unix socket created by --add-cloudsql-instances; still
+                       password auth — no IAM connector needed)
+
+The Engine + sessionmaker are created lazily on first use.
 """
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Iterator, Optional
 
+import pg8000.dbapi
 import sqlalchemy
-from sqlalchemy import select, text, update
-from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 import config
 from logger import get_logger
-from models import CLAIMABLE_STATUSES, Complaint, ComplaintStatus
 
 log = get_logger(__name__)
 
+_engine: sqlalchemy.engine.base.Engine | None = None
+_SessionLocal: sessionmaker[Session] | None = None
 
-# ---------------------------------------------------------------------------
-# Connection pool builders
-# ---------------------------------------------------------------------------
 
-def _create_conn_pool_cloud_sql() -> Engine:
-    """Build an engine using the Cloud SQL Python Connector + pg8000.
+def _create_conn_pool() -> sqlalchemy.engine.base.Engine:
+    """Build a SQLAlchemy Engine over a pg8000 connection pool."""
 
-    Mirrors the team-standard `_create_conn_pool` pattern verbatim:
-      - pg8000 driver
-      - enable_iam_auth=True (no password needed; ADC handles it)
-      - PRIVATE/PUBLIC IP toggle via env
-    """
-    from google.cloud.sql.connector import Connector, IPTypes  # type: ignore[import-not-found]
-
-    instance_connection_name = config.INSTANCE_CONNECTION_NAME
-    log.info("instance connection name: %s", instance_connection_name)
-
-    ip_type = (
-        IPTypes.PRIVATE
-        if os.getenv("PRIVATE_IP", "false").lower() == "true"
-        else IPTypes.PUBLIC
-    )
-
-    connector = Connector()
-
-    def getconn():
-        conn = connector.connect(
-            instance_connection_name,
-            "pg8000",
-            user=config.DB_USER,
-            db=config.DB_NAME,
-            enable_iam_auth=True,
-            ip_type=ip_type,
+    database_url = os.getenv("DATABASE_URL")
+    if database_url:
+        log.info("DB: using DATABASE_URL")
+        return sqlalchemy.create_engine(
+            database_url,
+            pool_size=5, max_overflow=2, pool_timeout=30,
+            pool_recycle=1800, pool_pre_ping=True,
         )
-        return conn
 
-    engine = sqlalchemy.create_engine(
+    host = config.PG_HOST
+    port = config.PG_PORT
+    user = config.PG_USER
+    password = config.PG_PASSWORD
+    db = config.PG_DB
+
+    is_unix_socket = host.startswith("/")
+    log.info("DB: host=%s port=%s db=%s user=%s mode=%s",
+             host, port, db, user, "unix_socket" if is_unix_socket else "tcp")
+
+    def getconn() -> pg8000.dbapi.Connection:
+        if is_unix_socket:
+            # Cloud Run mounts the socket dir; the socket file is .s.PGSQL.5432
+            sock = host if host.endswith(".s.PGSQL.5432") else f"{host}/.s.PGSQL.5432"
+            return pg8000.dbapi.connect(
+                user=user, password=password, database=db, unix_sock=sock,
+            )
+        return pg8000.dbapi.connect(
+            user=user, password=password, database=db, host=host, port=int(port),
+        )
+
+    return sqlalchemy.create_engine(
         "postgresql+pg8000://",
         creator=getconn,
-        # Pool size — maximum number of permanent connections.
-        pool_size=config.DB_POOL_SIZE,
-        # Temporarily exceeds the set pool size if no connections are available.
-        max_overflow=config.DB_MAX_OVERFLOW,
-        # Pool timeout in seconds.
-        pool_timeout=30,
-        # Maximum number of seconds a connection persists; reestablished after.
-        pool_recycle=1800,
-        pool_pre_ping=True,
+        pool_size=5,            # permanent connections
+        max_overflow=2,         # temporary extra connections under load
+        pool_timeout=30,        # seconds to wait for a free connection
+        pool_recycle=1800,      # recycle connections older than 30 min
+        pool_pre_ping=True,     # validate before use (survives Cloud Run idle)
     )
-    log.info(
-        "DB engine ready (Cloud SQL via pg8000 + IAM) | ip_type=%s pool=%d+%d",
-        ip_type.name, config.DB_POOL_SIZE, config.DB_MAX_OVERFLOW,
-    )
-    return engine
 
 
-def _create_conn_pool_local() -> Engine:
-    """Build an engine for local dev — plain pg8000 DSN with password."""
-    dsn = (
-        f"postgresql+pg8000://{config.DB_USER}:{config.DB_PASSWORD}"
-        f"@{config.DB_HOST}:{config.DB_PORT}/{config.DB_NAME}"
-    )
-    engine = sqlalchemy.create_engine(
-        dsn,
-        pool_size=config.DB_POOL_SIZE,
-        max_overflow=config.DB_MAX_OVERFLOW,
-        pool_timeout=30,
-        pool_recycle=1800,
-        pool_pre_ping=True,
-    )
-    log.info(
-        "DB engine ready (local pg8000) | host=%s:%d db=%s pool=%d+%d",
-        config.DB_HOST, config.DB_PORT, config.DB_NAME,
-        config.DB_POOL_SIZE, config.DB_MAX_OVERFLOW,
-    )
-    return engine
-
-
-# ---------------------------------------------------------------------------
-# Lifecycle
-# ---------------------------------------------------------------------------
-
-_engine: Optional[Engine] = None
-_sessionmaker: Optional[sessionmaker[Session]] = None
-
-
-def init_db() -> None:
-    """Build engine + sessionmaker once at startup."""
-    global _engine, _sessionmaker
-    if _engine is not None:
-        return
-
-    if config.INSTANCE_CONNECTION_NAME:
-        _engine = _create_conn_pool_cloud_sql()
-    else:
-        _engine = _create_conn_pool_local()
-
-    _sessionmaker = sessionmaker(_engine, expire_on_commit=False)
-
-    # Sanity check
-    with _engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    log.info("DB connectivity verified")
-
-
-def close_db() -> None:
-    global _engine, _sessionmaker
-    if _engine is not None:
-        _engine.dispose()
-        _engine = None
-        _sessionmaker = None
-        log.info("DB engine disposed")
+def get_engine() -> sqlalchemy.engine.base.Engine:
+    global _engine
+    if _engine is None:
+        _engine = _create_conn_pool()
+    return _engine
 
 
 def get_sessionmaker() -> sessionmaker[Session]:
-    if _sessionmaker is None:
-        raise RuntimeError("DB not initialised — call init_db() first")
-    return _sessionmaker
-
-
-@contextmanager
-def session_scope() -> Iterator[Session]:
-    """Open a session that commits on success and rolls back on error."""
-    sm = get_sessionmaker()
-    with sm() as session:
-        try:
-            yield session
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-
-
-# ---------------------------------------------------------------------------
-# Claim helper — the heart of safe concurrent sweeping
-# ---------------------------------------------------------------------------
-
-def claim_pending_complaints(
-    session: Session,
-    *,
-    batch_size: int,
-    max_attempts: int,
-) -> list[int]:
-    """Atomically claim up to `batch_size` complaints.
-
-    Uses SELECT ... FOR UPDATE SKIP LOCKED so two sweeps never grab the same
-    row. Each claimed row is bumped to PROCESSING + locked_at = now() before
-    the transaction commits, so any concurrent reader sees the lock.
-
-    Returns the list of complaint IDs claimed.
-    """
-    now = datetime.now(timezone.utc)
-
-    stmt = (
-        select(Complaint.id)
-        .where(Complaint.status.in_(CLAIMABLE_STATUSES))
-        .where(Complaint.attempt_count < max_attempts)
-        .order_by(Complaint.created_at.asc())
-        .limit(batch_size)
-        .with_for_update(skip_locked=True)
-    )
-    result = session.execute(stmt)
-    ids = [row[0] for row in result.all()]
-
-    if not ids:
-        return []
-
-    session.execute(
-        update(Complaint)
-        .where(Complaint.id.in_(ids))
-        .values(
-            status=ComplaintStatus.PROCESSING,
-            locked_at=now,
-            updated_at=now,
-            attempt_count=Complaint.attempt_count + 1,
+    global _SessionLocal
+    if _SessionLocal is None:
+        _SessionLocal = sessionmaker(
+            bind=get_engine(), autoflush=False, expire_on_commit=False
         )
-    )
+    return _SessionLocal
 
-    log.info("Claimed %d complaint(s): %s", len(ids), ids)
-    return ids
+
+def session_scope() -> Session:
+    """Return a new Session. Use as a context manager:
+        with session_scope() as s: ...
+    """
+    return get_sessionmaker()()
+
+
+def ping() -> bool:
+    """Quick connectivity check used by /health."""
+    with get_engine().connect() as conn:
+        conn.execute(sqlalchemy.text("SELECT 1"))
+    return True
+
+
+def dispose() -> None:
+    global _engine
+    if _engine is not None:
+        _engine.dispose()
+        _engine = None

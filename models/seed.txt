@@ -1,0 +1,31 @@
+-- =============================================================================
+-- seed.sql — simulate the OTHER service inserting an MHA complaint.
+-- Note: it sets ONLY the business columns from schema.txt. It does NOT set
+-- processing_state / job_id / attempt_count — those take their migration
+-- defaults (processing_state='RECEIVED'), which is exactly what happens in prod.
+--
+-- Run AFTER local_setup.sql + migrations.sql:
+--   psql "postgresql://USER:PASS@HOST:5432/DB" -f seed.sql
+-- =============================================================================
+
+WITH c AS (
+    INSERT INTO complaints (acknowledgement_no, sub_category, status)
+    VALUES ('31608230000001', 'Net Banking Fraud', 'OPEN')
+    RETURNING id
+),
+i AS (
+    INSERT INTO instruments (
+        complaint_id, requestor, payer_bank, payer_bank_code, mode_of_payment,
+        transaction_type, wallet, payer_mobile_number, payer_account_number,
+        state, district)
+    SELECT c.id, 'I4C-MHA', 'HSBC', '10', 'Debit'::payment_mode,
+           'P2P'::transaction_type, NULL, '919798868768', 'INHSBC500021738001',
+           'DELHI', 'South Delhi'
+    FROM c
+    RETURNING id
+)
+INSERT INTO incidents (
+    instrument_id, merchant_id, amount, disputed_amount, layer,
+    transaction_date, transaction_time)
+SELECT i.id, '244444444444', 35.00, 35.00, 0, DATE '2026-06-01', TIME '15:02:00'
+FROM i;

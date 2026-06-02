@@ -1,0 +1,26 @@
+{
+  "acknowledgement_no": "31608230000001",
+  "sub_category": "Net Banking Fraud",
+  "instrument": {
+    "requestor": "I4C-MHA",
+    "payer_bank": "HSBC",
+    "payer_bank_code": "10",
+    "mode_of_payment": "Debit",
+    "transaction_type": "P2P",
+    "wallet": null,
+    "payer_mobile_number": "919798868768",
+    "payer_account_number": "INHSBC500021738001",
+    "state": "DELHI",
+    "district": "South Delhi",
+    "incidents": [
+      {
+        "amount": "35.00",
+        "m": "244444444444",
+        "transaction_date": "2026-06-01",
+        "transaction_time": "15:02:00",
+        "disputed_amount": "35.00",
+        "layer": 0
+      }
+    ]
+  }
+}

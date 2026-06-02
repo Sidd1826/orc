@@ -1,240 +1,204 @@
 """
-main.py — FastAPI worker. Polls Postgres for pending complaints and runs
-the orchestrator state machine on each.
+main.py — FastAPI app for the fraud-ops orchestrator.
 
 Routes
-  GET  /healthz
-  POST /internal/sweep                  (Cloud Scheduler hits this every minute)
-  POST /internal/process/{complaint_id} (manual reprocess — ops tool)
-
-Architecture note: pg8000 is a SYNC driver, so the DB layer and the
-orchestrator are sync. FastAPI handlers are async but offload all DB +
-gateway work to a thread pool via asyncio.to_thread() — same pattern your
-gateway uses for the sync `requests` library.
+  GET  /health
+  POST /api/v1/complaints           ingest one MHA complaint (writes RECEIVED)
+  POST /process-batch               polling tick (called by Cloud Scheduler)
+  POST /process/{ack_no}            manual single-complaint trigger (ops/debug)
+  GET  /api/v1/complaints/{ack_no}  status + final response lookup
 
 Run locally:
-  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+  uvicorn main:app --host 0.0.0.0 --port 8080 --reload
 """
 from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Any
 
-import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from sqlalchemy import update
+from fastapi import Body, FastAPI, HTTPException
+from sqlalchemy import select
 
 import config
-import db as dbmod
-from gateway_client import GatewayClient
+import processor
+from db import dispose, ping, session_scope
 from logger import get_logger
-from models import Complaint, ComplaintStatus
-from orchestrator import (
-    OrchestratorError,
-    PendingHoldError,
-    process_complaint,
+from models import (
+    ApiResponseLog, Complaint, ComplaintProcessing, Incident, Instrument,
+    STATUS_OPEN,
 )
+from schemas import ComplaintIn, IngestAck
 
 log = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Lifespan
-# ---------------------------------------------------------------------------
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("=== Starting fraud worker ===")
-    log.info("Gateway: %s (iam_auth=%s)",
-             config.GATEWAY_BASE_URL, config.GATEWAY_USE_IAM_AUTH)
-    log.info("Sweep: batch_size=%d max_attempts=%d fresh_window=%dh",
-             config.SWEEP_BATCH_SIZE, config.MAX_ATTEMPTS, config.FRESH_WINDOW_HOURS)
-
-    # Sync init — runs once at startup, no need for to_thread.
-    dbmod.init_db()
-
-    http = httpx.Client(
-        timeout=httpx.Timeout(
-            connect=config.HTTP_CONNECT_TIMEOUT,
-            read=config.HTTP_READ_TIMEOUT,
-            write=config.HTTP_READ_TIMEOUT,
-            pool=config.HTTP_CONNECT_TIMEOUT,
-        ),
-        limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
-    )
-    app.state.http    = http
-    app.state.gateway = GatewayClient(http=http)
-
-    log.info("=== Worker ready ===")
+    log.info("=== Starting Fraud-Ops Orchestrator ===")
+    log.info("gateway=%s threshold=%dh batch=%d",
+             config.GATEWAY_BASE_URL, config.FRAUD_AGE_THRESHOLD_HOURS, config.BATCH_SIZE)
     try:
         yield
     finally:
-        http.close()
-        dbmod.close_db()
-        log.info("=== Worker shut down ===")
+        processor.gateway().close()
+        dispose()
+        log.info("=== Orchestrator shut down ===")
 
 
-app = FastAPI(title="Fraud Worker", version="1.0.0", lifespan=lifespan, docs_url="/docs")
+app = FastAPI(title="Fraud-Ops Orchestrator", version="1.0.0", lifespan=lifespan)
 
 
-@app.exception_handler(Exception)
-async def _unhandled(_req: Request, exc: Exception):
-    log.exception("Unhandled: %s", exc)
-    return JSONResponse(
-        {"error": "internal_error", "message": "An unexpected error occurred"},
-        status_code=500,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Health
-# ---------------------------------------------------------------------------
-
-@app.get("/healthz", tags=["Health"])
-async def healthz():
-    return {"status": "ok", "service": "fraud-worker"}
-
-
-# ---------------------------------------------------------------------------
-# Sweep — the scheduled trigger
-# ---------------------------------------------------------------------------
-
-@app.post("/internal/sweep", tags=["Internal"])
-async def sweep(request: Request) -> dict[str, Any]:
-    """Claim a batch of pending complaints and process each one."""
-    gateway: GatewayClient = request.app.state.gateway
-
-    complaint_ids = await asyncio.to_thread(_claim_batch)
-    if not complaint_ids:
-        return {"claimed": 0, "processed": 0, "results": []}
-
-    results: list[dict[str, Any]] = []
-    for cid in complaint_ids:
-        result = await asyncio.to_thread(_process_one, cid, gateway)
-        results.append(result)
-
-    processed = sum(1 for r in results if r["outcome"] == "ok")
-    return {"claimed": len(complaint_ids), "processed": processed, "results": results}
-
-
-# ---------------------------------------------------------------------------
-# Manual reprocess — ops tool
-# ---------------------------------------------------------------------------
-
-@app.post("/internal/process/{complaint_id}", tags=["Internal"])
-async def manual_process(complaint_id: int, request: Request) -> dict[str, Any]:
-    gateway: GatewayClient = request.app.state.gateway
-
-    found = await asyncio.to_thread(_force_processing, complaint_id)
-    if not found:
-        raise HTTPException(status_code=404, detail=f"Complaint {complaint_id} not found")
-
-    return await asyncio.to_thread(_process_one, complaint_id, gateway)
-
-
-# ---------------------------------------------------------------------------
-# Sync helpers — every function below runs inside a thread
-# ---------------------------------------------------------------------------
-
-def _claim_batch() -> list[int]:
-    with dbmod.session_scope() as session:
-        return dbmod.claim_pending_complaints(
-            session,
-            batch_size   = config.SWEEP_BATCH_SIZE,
-            max_attempts = config.MAX_ATTEMPTS,
-        )
-
-
-def _force_processing(complaint_id: int) -> bool:
-    now = datetime.now(timezone.utc)
-    with dbmod.session_scope() as session:
-        res = session.execute(
-            update(Complaint)
-            .where(Complaint.id == complaint_id)
-            .values(status=ComplaintStatus.PROCESSING, locked_at=now, updated_at=now)
-            .returning(Complaint.id)
-        )
-        return res.scalar_one_or_none() is not None
-
-
-def _process_one(complaint_id: int, gateway: GatewayClient) -> dict[str, Any]:
-    log.info("--- process complaint %d ---", complaint_id)
+@app.get("/health", tags=["Health"])
+async def health():
     try:
-        with dbmod.session_scope() as session:
-            process_complaint(
-                session=session, gateway=gateway, complaint_id=complaint_id,
-            )
-        return {"complaintId": complaint_id, "outcome": "ok"}
-
-    except PendingHoldError as e:
-        log.error("Complaint %d: %s", complaint_id, e)
-        _mark(complaint_id, ComplaintStatus.MANUAL_REVIEW, str(e))
-        return {"complaintId": complaint_id, "outcome": "manual_review", "reason": str(e)}
-
-    except OrchestratorError as e:
-        log.error("Complaint %d orchestrator error (terminal=%s): %s",
-                  complaint_id, e.terminal, e)
-        target = ComplaintStatus.FAILED_TERMINAL if e.terminal else ComplaintStatus.FAILED_RETRYABLE
-        _mark(complaint_id, target, str(e))
-        return {"complaintId": complaint_id, "outcome": target.lower(), "reason": str(e)}
-
-    except Exception as e:
-        log.exception("Complaint %d unexpected failure", complaint_id)
-        _mark_failure_with_attempt_check(complaint_id, str(e))
-        return {"complaintId": complaint_id, "outcome": "failed", "reason": str(e)}
-
-
-def _mark(complaint_id: int, status: str, error: str) -> None:
-    now = datetime.now(timezone.utc)
-    with dbmod.session_scope() as session:
-        session.execute(
-            update(Complaint)
-            .where(Complaint.id == complaint_id)
-            .values(status=status, last_error=error[:2000], updated_at=now)
-        )
-
-
-def _mark_failure_with_attempt_check(complaint_id: int, error: str) -> None:
-    now = datetime.now(timezone.utc)
-    with dbmod.session_scope() as session:
-        res = session.execute(
-            update(Complaint)
-            .where(Complaint.id == complaint_id)
-            .where(Complaint.attempt_count >= config.MAX_ATTEMPTS)
-            .values(
-                status     = ComplaintStatus.FAILED_TERMINAL,
-                last_error = error[:2000],
-                updated_at = now,
-            )
-            .returning(Complaint.id)
-        )
-        if res.scalar_one_or_none() is not None:
-            return
-
-        session.execute(
-            update(Complaint)
-            .where(Complaint.id == complaint_id)
-            .values(
-                status     = ComplaintStatus.FAILED_RETRYABLE,
-                last_error = error[:2000],
-                updated_at = now,
-            )
-        )
+        await asyncio.to_thread(ping)
+        db_ok = True
+    except Exception as e:  # noqa: BLE001
+        log.error("health DB ping failed: %s", e)
+        db_ok = False
+    return {"status": "ok" if db_ok else "degraded",
+            "service": "fraud-ops-orchestrator", "db": db_ok}
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Ingestion — TESTING ONLY.
+# In production, a separate service writes complaint/instrument/incidents rows
+# into Postgres; this orchestrator just polls them. This endpoint exists so you
+# can seed rows locally without that other service. (You can also use seed.sql.)
 # ---------------------------------------------------------------------------
+
+@app.post("/api/v1/complaints", response_model=IngestAck, tags=["Ingestion"])
+async def ingest_complaint(payload: ComplaintIn = Body(...)):
+    return await asyncio.to_thread(_ingest, payload)
+
+
+def _ingest(payload: ComplaintIn) -> IngestAck:
+    """TESTING ONLY. Writes ONLY the shared schema.txt tables, exactly as the
+    other service would — it does NOT create the sidecar processing row. The
+    poller bootstraps that on first pickup, so this faithfully simulates prod."""
+    with session_scope() as s:
+        existing = s.execute(
+            select(Complaint).where(
+                Complaint.acknowledgement_no == payload.acknowledgement_no)
+        ).scalar_one_or_none()
+        if existing:
+            log.info("duplicate ingest ack_no=%s", payload.acknowledgement_no)
+            return IngestAck(acknowledgement_no=existing.acknowledgement_no,
+                             job_id="", status="ALREADY_RECEIVED")
+
+        complaint = Complaint(
+            acknowledgement_no=payload.acknowledgement_no,
+            sub_category=payload.sub_category,
+            status=STATUS_OPEN,
+        )
+        inst = payload.instrument
+        instrument = Instrument(
+            requestor=inst.requestor, payer_bank=inst.payer_bank,
+            payer_bank_code=inst.payer_bank_code, mode_of_payment=inst.mode_of_payment,
+            transaction_type=inst.transaction_type, wallet=inst.wallet,
+            payer_mobile_number=inst.payer_mobile_number,
+            payer_account_number=inst.payer_account_number,
+            state=inst.state, district=inst.district,
+        )
+        instrument.incidents = [
+            Incident(
+                merchant_id=i.merchant_id, amount=i.amount,
+                disputed_amount=i.disputed_amount, layer=i.layer,
+                transaction_date=i.transaction_date, transaction_time=i.transaction_time,
+            )
+            for i in inst.incidents
+        ]
+        complaint.instrument = instrument
+        s.add(complaint)
+        s.commit()
+        log.info("ingested ack_no=%s incidents=%d (sidecar created by poller)",
+                 payload.acknowledgement_no, len(inst.incidents))
+        return IngestAck(acknowledgement_no=payload.acknowledgement_no,
+                         job_id="", status="RECEIVED")
+
+
+# ---------------------------------------------------------------------------
+# Polling tick — Cloud Scheduler hits this every 1-2 minutes.
+# ---------------------------------------------------------------------------
+
+@app.post("/process-batch", tags=["Processing"])
+async def process_batch():
+    return await asyncio.to_thread(processor.process_batch)
+
+
+# ---------------------------------------------------------------------------
+# Manual single-complaint trigger (ops / debugging)
+# ---------------------------------------------------------------------------
+
+@app.post("/process/{ack_no}", tags=["Processing"])
+async def process_one(ack_no: str):
+    def _run():
+        with session_scope() as s:
+            c = s.execute(
+                select(Complaint).where(Complaint.acknowledgement_no == ack_no)
+            ).scalar_one_or_none()
+            if c is None:
+                return None
+            p = s.execute(
+                select(ComplaintProcessing).where(
+                    ComplaintProcessing.complaint_id == c.id)
+            ).scalar_one_or_none()
+            if p is None:
+                p = ComplaintProcessing(
+                    complaint_id=c.id, acknowledgement_no=c.acknowledgement_no,
+                    job_id=f"BANKS-{uuid.uuid4()}",
+                )
+                s.add(p); s.commit()
+            pid = p.id
+        return processor._process_one(pid)
+
+    state = await asyncio.to_thread(_run)
+    if state is None:
+        raise HTTPException(404, detail=f"complaint {ack_no} not found")
+    return {"acknowledgement_no": ack_no, "state": state}
+
+
+# ---------------------------------------------------------------------------
+# Status lookup
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/complaints/{ack_no}", tags=["Ingestion"])
+async def get_complaint(ack_no: str):
+    def _get():
+        with session_scope() as s:
+            c = s.execute(
+                select(Complaint).where(Complaint.acknowledgement_no == ack_no)
+            ).scalar_one_or_none()
+            if c is None:
+                return None
+            p = s.execute(
+                select(ComplaintProcessing).where(
+                    ComplaintProcessing.complaint_id == c.id)
+            ).scalar_one_or_none()
+            resp = None
+            if p and p.job_id:
+                resp = s.execute(
+                    select(ApiResponseLog).where(ApiResponseLog.job_id == p.job_id)
+                ).scalar_one_or_none()
+            return {
+                "acknowledgement_no": c.acknowledgement_no,
+                "complaint_status": c.status,           # shared table (read-only)
+                "job_id": p.job_id if p else None,
+                "processing_state": p.processing_state if p else "NOT_PICKED_UP",
+                "attempt_count": p.attempt_count if p else 0,
+                "last_error": p.last_error if p else None,
+                "response": resp.response_payload if resp else None,
+            }
+
+    data = await asyncio.to_thread(_get)
+    if data is None:
+        raise HTTPException(404, detail=f"complaint {ack_no} not found")
+    return data
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        reload=False,
-    )
+    uvicorn.run("main:app", host="0.0.0.0",
+                port=int(os.getenv("PORT", "8080")), reload=False)

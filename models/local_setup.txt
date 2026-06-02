@@ -1,0 +1,92 @@
+-- =============================================================================
+-- local_setup.sql — base tables for a FRESH local Postgres, transcribed from
+-- your schema.txt. Run this FIRST, then migrations.sql.
+--   psql "$DATABASE_URL" -f local_setup.sql
+--   psql "$DATABASE_URL" -f migrations.sql
+-- (Note: use a libpq URL for psql, e.g.
+--    postgresql://fraud:fraud@localhost:5432/fraudops
+--  not the pg8000 URL the app uses.)
+-- =============================================================================
+
+-- ENUMS
+DO $$ BEGIN
+    CREATE TYPE payment_mode AS ENUM ('Credit','Debit','UPI','NEFT','RTGS','IMPS');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE transaction_type AS ENUM ('P2P','P2M','Collect','Refund','Unknown');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE fraud_sub_category AS ENUM (
+        'UPI Related Frauds','Card Fraud','Net Banking Fraud','Wallet Fraud','Other');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE api_response_status AS ENUM ('SUCCESS','FAILURE','PENDING','TIMEOUT');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- TABLE 1: complaints
+CREATE TABLE IF NOT EXISTS complaints (
+    id                  BIGSERIAL PRIMARY KEY,
+    acknowledgement_no  VARCHAR(20)         NOT NULL UNIQUE,
+    sub_category        fraud_sub_category  NOT NULL,
+    status              VARCHAR(20)         NOT NULL DEFAULT 'OPEN',
+    created_at          TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ         NOT NULL DEFAULT NOW()
+);
+
+-- TABLE 2: instruments
+CREATE TABLE IF NOT EXISTS instruments (
+    id                   BIGSERIAL PRIMARY KEY,
+    complaint_id         BIGINT          NOT NULL REFERENCES complaints(id) ON DELETE CASCADE,
+    requestor            VARCHAR(50)     NOT NULL,
+    payer_bank           VARCHAR(100)    NOT NULL,
+    payer_bank_code      VARCHAR(10)     NOT NULL,
+    mode_of_payment      payment_mode    NOT NULL,
+    transaction_type     transaction_type NOT NULL DEFAULT 'Unknown',
+    wallet               VARCHAR(50),
+    payer_mobile_number  VARCHAR(15)     NOT NULL,
+    payer_account_number VARCHAR(30)     NOT NULL,
+    state                VARCHAR(60),
+    district             VARCHAR(60),
+    created_at           TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_instrument_per_complaint UNIQUE (complaint_id)
+);
+
+-- TABLE 3: incidents
+CREATE TABLE IF NOT EXISTS incidents (
+    id                  BIGSERIAL PRIMARY KEY,
+    instrument_id       BIGINT          NOT NULL REFERENCES instruments(id) ON DELETE CASCADE,
+    merchant_id         VARCHAR(30)     NOT NULL,
+    amount              NUMERIC(12,2)   NOT NULL CHECK (amount > 0),
+    disputed_amount     NUMERIC(12,2)   NOT NULL CHECK (disputed_amount >= 0),
+    layer               SMALLINT        NOT NULL DEFAULT 0,
+    transaction_date    DATE            NOT NULL,
+    transaction_time    TIME            NOT NULL,
+    transaction_at      TIMESTAMPTZ     GENERATED ALWAYS AS (
+                            (transaction_date + transaction_time) AT TIME ZONE 'Asia/Kolkata'
+                        ) STORED,
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+-- TABLE 4: api_response_logs
+CREATE TABLE IF NOT EXISTS api_response_logs (
+    id                  BIGSERIAL PRIMARY KEY,
+    complaint_id        BIGINT          REFERENCES complaints(id) ON DELETE SET NULL,
+    acknowledgement_no  VARCHAR(20)     NOT NULL,
+    job_id              VARCHAR(60)     NOT NULL UNIQUE,
+    response_code       VARCHAR(10)     NOT NULL,
+    response_message    api_response_status NOT NULL DEFAULT 'SUCCESS',
+    response_payload    JSONB,
+    is_success          BOOLEAN         GENERATED ALWAYS AS (response_code = '00') STORED,
+    requested_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    responded_at        TIMESTAMPTZ,
+    response_latency_ms INT             GENERATED ALWAYS AS (
+                            EXTRACT(MILLISECONDS FROM (responded_at - requested_at))::INT
+                        ) STORED,
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);

@@ -1,0 +1,568 @@
+r"""
+processor.py — the orchestration engine.
+
+Trigger model: NO queue. Cloud Scheduler hits /process-batch every 1-2 min;
+this module claims a batch of un-finished complaints with
+`FOR UPDATE SKIP LOCKED`, leases them, and runs a resumable state machine.
+
+State machine (persisted on complaint_processing.processing_state — a SIDECAR
+table this service owns; the shared `complaints` table is never written):
+
+  RECEIVED -> CLASSIFIED -> ENRICHED -> BALANCE_CHECKED
+           -> HOLD_APPLIED -> RECONCILING -> RESOLVED
+                                          \-> NEEDS_REVIEW (terminal, human)
+
+Money rule (from your prose):
+  D = total disputed amount, B = available balance.
+  B >= D  -> hold D, done.
+  B <  D  -> hold B, remaining R = D - B, then trace R through CBDOC/BigQuery,
+             collecting every debited transaction until reconciled (or layers
+             exhausted -> NEEDS_REVIEW with whatever was collected).
+
+Idempotency: apply-hold is guarded by a UNIQUE idempotency_key in
+processing_steps, so a retry never double-holds a customer's funds.
+"""
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any, Optional
+
+from sqlalchemy import or_, select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+import config
+from classifier import CHANNEL_UPI, DIR_DEBIT, classify
+from db import session_scope
+from gateway_client import GatewayClient, GatewayError
+from logger import get_logger
+from models import (
+    ST_BALANCE_CHECKED, ST_CLASSIFIED, ST_ENRICHED, ST_HOLD_APPLIED,
+    ST_NEEDS_REVIEW, ST_RECEIVED, ST_RECONCILING, ST_RESOLVED,
+    TERMINAL_STATES,
+    ApiResponseLog, Complaint, ComplaintProcessing, Incident, Instrument,
+    ProcessingStep,
+)
+
+log = get_logger(__name__)
+
+_gateway: Optional[GatewayClient] = None
+
+
+def gateway() -> GatewayClient:
+    global _gateway
+    if _gateway is None:
+        _gateway = GatewayClient()
+    return _gateway
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _dig(d: Any, path: str) -> Any:
+    """Read a dotted path out of a nested dict; None if missing."""
+    cur = d
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+
+# ===========================================================================
+# Batch claim (the polling tick)
+# ===========================================================================
+
+def _bootstrap_processing_rows(s: Session) -> int:
+    """Create a complaint_processing row for any complaint that doesn't have one
+    yet (i.e. rows the OTHER service just inserted). Does NOT touch complaints.
+    INSERT ... SELECT ... ON CONFLICT DO NOTHING is race-safe across instances.
+    """
+    res = s.execute(text(
+        """
+        INSERT INTO complaint_processing (complaint_id, acknowledgement_no, processing_state)
+        SELECT c.id, c.acknowledgement_no, 'RECEIVED'
+        FROM complaints c
+        LEFT JOIN complaint_processing p ON p.complaint_id = c.id
+        WHERE p.id IS NULL
+        ON CONFLICT (complaint_id) DO NOTHING
+        """
+    ))
+    s.commit()
+    return res.rowcount or 0
+
+
+def claim_batch(limit: int) -> list[int]:
+    """Bootstrap missing sidecar rows, then claim up to `limit` non-terminal,
+    lease-free processing rows. Returns the claimed complaint_processing ids.
+    Nothing in the shared `complaints` table is written."""
+    now = _now()
+    with session_scope() as s:
+        _bootstrap_processing_rows(s)
+
+        rows = s.execute(
+            select(ComplaintProcessing)
+            .where(
+                ComplaintProcessing.processing_state.notin_(tuple(TERMINAL_STATES)),
+                ComplaintProcessing.attempt_count < config.MAX_ATTEMPTS,
+                or_(ComplaintProcessing.lease_expires_at.is_(None),
+                    ComplaintProcessing.lease_expires_at < now),
+            )
+            .order_by(ComplaintProcessing.created_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).scalars().all()
+
+        lease = now + timedelta(seconds=config.LEASE_SECONDS)
+        ids = []
+        for p in rows:
+            p.lease_expires_at = lease
+            if not p.job_id:
+                p.job_id = f"BANKS-{uuid.uuid4()}"
+            ids.append(p.id)
+        s.commit()
+        if ids:
+            log.info("claimed %d complaints", len(ids))
+        return ids
+
+
+def process_batch() -> dict[str, Any]:
+    """One polling tick: claim a batch and process each in its own transaction."""
+    ids = claim_batch(config.BATCH_SIZE)
+    processed = []
+    for pid in ids:
+        state = _process_one(pid)
+        processed.append({"processing_id": pid, "state": state})
+    return {"claimed": len(ids), "processed": processed}
+
+
+def _process_one(processing_id: int) -> str:
+    """Run the state machine for one complaint_processing row. Failures are
+    recorded and the row is left for the next tick (until MAX_ATTEMPTS)."""
+    try:
+        with session_scope() as s:
+            p = s.get(ComplaintProcessing, processing_id)
+            if p is None or p.processing_state in TERMINAL_STATES:
+                return p.processing_state if p else "MISSING"
+            _run_state_machine(s, p)
+            return p.processing_state
+    except Exception as e:                      # noqa: BLE001 - record & defer
+        log.exception("processing failed for processing_id=%s: %s", processing_id, e)
+        _record_failure(processing_id, str(e))
+        with session_scope() as s:
+            p = s.get(ComplaintProcessing, processing_id)
+            return p.processing_state if p else "MISSING"
+
+
+def _record_failure(processing_id: int, err: str) -> None:
+    with session_scope() as s:
+        p = s.get(ComplaintProcessing, processing_id)
+        if p is None:
+            return
+        p.attempt_count = (p.attempt_count or 0) + 1
+        p.last_error = err[:2000]
+        if p.attempt_count >= config.MAX_ATTEMPTS:
+            p.processing_state = ST_NEEDS_REVIEW
+            p.lease_expires_at = None
+            log.error("processing_id=%s exhausted retries -> NEEDS_REVIEW", processing_id)
+        # else: lease left in place; next tick re-picks after it expires (backoff)
+        s.commit()
+
+
+# ===========================================================================
+# State machine
+# ===========================================================================
+
+def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
+    c = p.complaint
+    instrument = c.instrument if c else None
+    incidents = instrument.incidents if instrument else []
+    if not instrument or not incidents:
+        _to_review(s, p, "no instrument/incidents on complaint")
+        return
+
+    cls = classify(instrument, incidents, c.sub_category)
+    account = instrument.payer_account_number
+    total_disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
+
+    # Advance one step at a time; commit after each so retries resume here.
+    guard = 0
+    while p.processing_state not in TERMINAL_STATES and guard < 20:
+        guard += 1
+        st = p.processing_state
+        log.info("[%s] state=%s", p.acknowledgement_no, st)
+
+        if st == ST_RECEIVED:
+            p.processing_state = ST_CLASSIFIED
+
+        elif st == ST_CLASSIFIED:
+            _enrich(s, p, cls, instrument, incidents)
+            p.processing_state = ST_ENRICHED
+
+        elif st == ST_ENRICHED:
+            # UPI-debit fraud only needs beneficiary details -> no hold.
+            if cls.channel == CHANNEL_UPI and cls.direction == DIR_DEBIT:
+                _finalize_bene_only(s, p, incidents)
+                p.processing_state = ST_RESOLVED
+                break
+            p.processing_state = ST_BALANCE_CHECKED
+
+        elif st == ST_BALANCE_CHECKED:
+            balance = _available_balance(s, p, account)
+            held, remaining = _apply_holds(s, p, instrument, total_disputed, balance)
+            _stash(s, p, "REMAINING", {"value": str(remaining), "held": str(held)})
+            p.processing_state = ST_HOLD_APPLIED
+
+        elif st == ST_HOLD_APPLIED:
+            remaining = Decimal(_unstash(s, p, "REMAINING").get("value", "0"))
+            if remaining > 0:
+                p.processing_state = ST_RECONCILING
+            else:
+                _finalize(s, p, instrument, incidents, traced_txns=[])
+                p.processing_state = ST_RESOLVED
+
+        elif st == ST_RECONCILING:
+            remaining = Decimal(_unstash(s, p, "REMAINING").get("value", "0"))
+            traced, reconciled = _trace_and_collect(s, p, incidents, remaining)
+            _finalize(s, p, instrument, incidents, traced_txns=traced)
+            p.processing_state = ST_RESOLVED if reconciled else ST_NEEDS_REVIEW
+            if not reconciled:
+                p.last_error = "could not fully reconcile within trace-layer cap"
+            p.lease_expires_at = None
+            break
+
+        s.add(p)
+        s.commit()
+
+    if p.processing_state == ST_RESOLVED:
+        p.lease_expires_at = None
+        s.commit()
+
+
+def _to_review(s: Session, p: ComplaintProcessing, reason: str) -> None:
+    p.processing_state = ST_NEEDS_REVIEW
+    p.last_error = reason
+    p.lease_expires_at = None
+    s.commit()
+    log.error("[%s] -> NEEDS_REVIEW: %s", p.acknowledgement_no, reason)
+
+
+# ===========================================================================
+# Steps (each cached in processing_steps so repeats don't re-hit upstream)
+# ===========================================================================
+
+def _step_get(s: Session, p: ComplaintProcessing, step: str,
+              idem: Optional[str] = None) -> Optional[ProcessingStep]:
+    key = idem or f"{step}:{p.acknowledgement_no}"
+    return s.execute(
+        select(ProcessingStep).where(ProcessingStep.idempotency_key == key)
+    ).scalar_one_or_none()
+
+
+def _step_record(s: Session, p: ComplaintProcessing, step: str, idem: str,
+                 request: dict, response: dict, status: str = "SUCCESS") -> ProcessingStep:
+    row = ProcessingStep(
+        complaint_id=p.complaint_id, acknowledgement_no=p.acknowledgement_no,
+        job_id=p.job_id, step=step, idempotency_key=idem, status=status,
+        request_payload=request, response_payload=response,
+    )
+    s.add(row)
+    try:
+        s.flush()
+    except IntegrityError:          # concurrent insert — reuse existing
+        s.rollback()
+        return _step_get(s, p, step, idem)   # type: ignore[return-value]
+    return row
+
+
+def _stash(s: Session, p: ComplaintProcessing, name: str, data: dict) -> None:
+    idem = f"STASH:{name}:{p.acknowledgement_no}"
+    existing = _step_get(s, p, name, idem)
+    if existing:
+        existing.response_payload = data
+        s.flush()
+    else:
+        _step_record(s, p, f"STASH_{name}", idem, {}, data)
+
+
+def _unstash(s: Session, p: ComplaintProcessing, name: str) -> dict:
+    idem = f"STASH:{name}:{p.acknowledgement_no}"
+    row = _step_get(s, p, name, idem)
+    return (row.response_payload or {}) if row else {}
+
+
+def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
+            incidents: list[Incident]) -> None:
+    """Fetch beneficiary / transaction context: UPI bene, live DD, or CBDOC."""
+    account = instrument.payer_account_number
+
+    if cls.channel == CHANNEL_UPI and cls.direction == DIR_DEBIT:
+        for inc in incidents:
+            idem = f"UPI:{p.acknowledgement_no}:{inc.merchant_id}"
+            if _step_get(s, p, "UPI_BENE", idem):
+                continue
+            ts = f"{inc.transaction_date} {inc.transaction_time}"
+            resp = gateway().upi_bene_lookup(
+                rrn=inc.merchant_id, account_number=account,
+                amount=str(inc.amount), transaction_timestamp=ts,
+            )
+            _step_record(s, p, "UPI_BENE", idem,
+                         {"rrn": inc.merchant_id}, resp)
+        return
+
+    if cls.is_recent:
+        _dd_enquiry(s, p, account)              # live demand-deposit
+    else:
+        for inc in incidents:                   # CBDOC / BigQuery archive
+            _bq_locate(s, p, account, inc)
+
+
+def _dd_enquiry(s: Session, p: ComplaintProcessing, account: str) -> dict:
+    idem = f"DD:{p.acknowledgement_no}:{account}"
+    existing = _step_get(s, p, "DD_ENQUIRY", idem)
+    if existing and existing.status == "SUCCESS":
+        return existing.response_payload or {}
+    resp = gateway().demand_deposit(account)
+    _step_record(s, p, "DD_ENQUIRY", idem, {"account": account}, resp)
+    return resp
+
+
+def _available_balance(s: Session, p: ComplaintProcessing, account: str) -> Decimal:
+    resp = _dd_enquiry(s, p, account)
+    raw = _dig(resp, config.DD_AVAILABLE_BALANCE_PATH)
+    if raw is None:
+        raise GatewayError(
+            f"available balance not found at path '{config.DD_AVAILABLE_BALANCE_PATH}' "
+            f"in DD response (keys={list(resp.keys())})"
+        )
+    return Decimal(str(raw))
+
+
+def _bq_locate(s: Session, p: ComplaintProcessing, account: str, inc: Incident) -> dict:
+    """Find the disputed transaction in CBDOC by account + amount + date + ref."""
+    idem = f"BQ:{p.acknowledgement_no}:{inc.merchant_id}"
+    existing = _step_get(s, p, "BQ_TRACE", idem)
+    if existing and existing.status == "SUCCESS":
+        return existing.response_payload or {}
+    filters = {
+        config.BQ_FIELD_ACCOUNT: account,
+        config.BQ_FIELD_AMOUNT:  float(inc.amount),
+        config.BQ_FIELD_DATE:    int(inc.transaction_date.strftime("%Y%m%d")),
+        config.BQ_FIELD_REF:     inc.merchant_id,
+    }
+    resp = gateway().bigquery_search(filters, limit=100)
+    _step_record(s, p, "BQ_TRACE", idem, filters, resp)
+    return resp
+
+
+# ===========================================================================
+# Hold (idempotent)
+# ===========================================================================
+
+def _apply_holds(s: Session, p: ComplaintProcessing, instrument: Instrument,
+                 disputed: Decimal, balance: Decimal) -> tuple[Decimal, Decimal]:
+    """Hold min(disputed, balance). Returns (amount_held, remaining_to_trace)."""
+    to_hold = min(disputed, balance) if balance > 0 else Decimal("0")
+    remaining = disputed - to_hold
+
+    if to_hold <= 0:
+        log.info("[%s] no balance to hold; remaining=%s", p.acknowledgement_no, remaining)
+        return Decimal("0"), remaining
+
+    account = instrument.payer_account_number
+    currency = "INR"
+    amount_str = f"{to_hold:.2f}"
+    # Idempotency key ties the hold to (ack, account, amount): a retry that
+    # finds a SUCCESS here will NOT call apply-hold again.
+    idem = f"HOLD:{p.acknowledgement_no}:{account}:{amount_str}"
+
+    existing = _step_get(s, p, "HOLD", idem)
+    if existing and existing.status == "SUCCESS":
+        log.info("[%s] hold already applied (idempotent skip)", p.acknowledgement_no)
+        return to_hold, remaining
+
+    # Reserve the key first (PENDING). If another worker raced us, the UNIQUE
+    # constraint makes _step_record return the existing row instead.
+    step = _step_record(s, p, "HOLD", idem,
+                        {"account": account, "amount": amount_str},
+                        {}, status="PENDING")
+    if step.status == "SUCCESS":
+        return to_hold, remaining
+
+    resp = gateway().apply_hold(account_number=account, currency=currency, amount=amount_str)
+    step.status = "SUCCESS"
+    step.response_payload = resp
+    s.flush()
+    log.info("[%s] hold applied amount=%s remaining=%s",
+             p.acknowledgement_no, amount_str, remaining)
+    return to_hold, remaining
+
+
+# ===========================================================================
+# Money-trail trace + collection
+# ===========================================================================
+
+def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incident],
+                       remaining: Decimal) -> tuple[list[dict], bool]:
+    """Walk the CBDOC money trail up to MAX_TRACE_LAYERS, collecting every
+    debited transaction. Returns (collected_transactions, fully_reconciled)."""
+    collected: list[dict] = []
+    recovered = Decimal("0")
+
+    # Seed the frontier with the beneficiary account(s) of the fraud incidents.
+    frontier: list[str] = []
+    for inc in incidents:
+        bq = _bq_locate(s, p, _seed_account(p), inc)
+        for row in _rows(bq):
+            collected.append(_to_mha_txn(row))
+            recovered += _row_amount(row)
+            nxt = row.get(config.BQ_FIELD_BENE_ACCOUNT)
+            if nxt:
+                frontier.append(str(nxt))
+
+    layer = 1
+    while frontier and recovered < remaining and layer <= config.MAX_TRACE_LAYERS:
+        next_frontier: list[str] = []
+        for acct in frontier:
+            idem = f"BQLAYER:{p.acknowledgement_no}:{layer}:{acct}"
+            existing = _step_get(s, p, "BQ_TRACE", idem)
+            if existing and existing.status == "SUCCESS":
+                resp = existing.response_payload or {}
+            else:
+                resp = gateway().bigquery_search(
+                    {config.BQ_FIELD_ACCOUNT: acct}, limit=200)
+                _step_record(s, p, "BQ_TRACE", idem, {"account": acct, "layer": layer}, resp)
+            for row in _rows(resp):
+                collected.append(_to_mha_txn(row, layer=layer))
+                recovered += _row_amount(row)
+                nxt = row.get(config.BQ_FIELD_BENE_ACCOUNT)
+                if nxt:
+                    next_frontier.append(str(nxt))
+        frontier = next_frontier
+        layer += 1
+
+    fully = recovered >= remaining
+    log.info("[%s] trace done layers=%d collected=%d recovered=%s remaining=%s reconciled=%s",
+             p.acknowledgement_no, layer - 1, len(collected), recovered, remaining, fully)
+    return collected, fully
+
+
+def _seed_account(p: ComplaintProcessing) -> str:
+    return p.complaint.instrument.payer_account_number
+
+
+def _rows(bq_resp: dict) -> list[dict]:
+    return bq_resp.get("rows", []) if isinstance(bq_resp, dict) else []
+
+
+def _row_amount(row: dict) -> Decimal:
+    raw = row.get(config.BQ_FIELD_AMOUNT)
+    try:
+        return Decimal(str(raw)) if raw is not None else Decimal("0")
+    except Exception:
+        return Decimal("0")
+
+
+def _to_mha_txn(row: dict, layer: int = 0) -> dict:
+    """Map a CBDOC/BigQuery row into the MHA response transaction shape.
+    Field mapping is best-effort against the OG* whitelist — confirm & refine."""
+    return {
+        "rrn_transaction_id": row.get(config.BQ_FIELD_REF),
+        "payee_account_number": row.get(config.BQ_FIELD_BENE_ACCOUNT),
+        "payee_name": row.get("OGBEA1"),
+        "amount": str(row.get(config.BQ_FIELD_AMOUNT, "")),
+        "transaction_datetime": _fmt_dt(row.get(config.BQ_FIELD_DATE), row.get("OGCPTM")),
+        "txn_type": "Money Transfer To",
+        "status_code": "00",
+        "layer": layer,
+        "_raw": row,
+    }
+
+
+def _fmt_dt(d: Any, t: Any) -> Optional[str]:
+    if d is None:
+        return None
+    ds = str(d)
+    ts = str(t).zfill(6) if t is not None else "000000"
+    try:
+        return (f"{ds[0:4]}-{ds[4:6]}-{ds[6:8]} "
+                f"{ts[0:2]}:{ts[2:4]}:{ts[4:6]}")
+    except Exception:
+        return ds
+
+
+# ===========================================================================
+# Finalise — write the MHA-facing response row
+# ===========================================================================
+
+def _hold_txns(s: Session, p: ComplaintProcessing) -> list[dict]:
+    """Emit applied holds in the MHA 'Put on Hold' transaction shape."""
+    rows = s.execute(
+        select(ProcessingStep).where(
+            ProcessingStep.complaint_id == p.complaint_id,
+            ProcessingStep.step == "HOLD",
+            ProcessingStep.status == "SUCCESS",
+        )
+    ).scalars().all()
+    out = []
+    for r in rows:
+        req = r.request_payload or {}
+        out.append({
+            "root_account_number": req.get("account"),
+            "amount": req.get("amount"),
+            "txn_type": "Transaction Put on Hold",
+            "txn_type_id": "1",
+            "status_code": "00",
+            "hold_response": r.response_payload,
+        })
+    return out
+
+
+def _finalize(s: Session, p: ComplaintProcessing, instrument: Instrument,
+              incidents: list[Incident], traced_txns: list[dict]) -> None:
+    payload = {
+        "acknowledgement_no": p.acknowledgement_no,
+        "job_id": p.job_id,
+        "transactions": _hold_txns(s, p) + traced_txns,
+    }
+    _write_response_log(s, p, payload)
+
+
+def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> None:
+    txns = []
+    for inc in incidents:
+        step = _step_get(s, p, "UPI_BENE", f"UPI:{p.acknowledgement_no}:{inc.merchant_id}")
+        txns.append({
+            "rrn_transaction_id": inc.merchant_id,
+            "amount": str(inc.amount),
+            "txn_type": "Beneficiary Lookup",
+            "status_code": "00",
+            "bene": (step.response_payload if step else None),
+        })
+    _write_response_log(s, p, {
+        "acknowledgement_no": p.acknowledgement_no,
+        "job_id": p.job_id,
+        "transactions": txns,
+    })
+
+
+def _write_response_log(s: Session, p: ComplaintProcessing, payload: dict) -> None:
+    existing = s.execute(
+        select(ApiResponseLog).where(ApiResponseLog.job_id == p.job_id)
+    ).scalar_one_or_none()
+    if existing:
+        existing.response_payload = payload
+        existing.responded_at = _now()
+    else:
+        s.add(ApiResponseLog(
+            complaint_id=p.complaint_id, acknowledgement_no=p.acknowledgement_no,
+            job_id=p.job_id, response_code="00", response_message="SUCCESS",
+            response_payload=payload, responded_at=_now(),
+        ))
+    s.flush()
+    log.info("[%s] response log written job_id=%s txns=%d",
+             p.acknowledgement_no, p.job_id, len(payload.get("transactions", [])))
