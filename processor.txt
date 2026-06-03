@@ -79,6 +79,43 @@ def _dig(d: Any, path: str) -> Any:
     return cur
 
 
+def _deep_find_amount(obj: Any, container_key: str, amount_key: str = "amount",
+                      _path: str = "") -> tuple[Any, str]:
+    """Find `container_key`.`amount_key` anywhere in a nested dict/list.
+    Returns (value, dotted_path) or (None, "")."""
+    if isinstance(obj, dict):
+        if (container_key in obj and isinstance(obj[container_key], dict)
+                and amount_key in obj[container_key]):
+            here = f"{_path}.{container_key}.{amount_key}".lstrip(".")
+            return obj[container_key][amount_key], here
+        for k, v in obj.items():
+            val, found = _deep_find_amount(v, container_key, amount_key,
+                                           f"{_path}.{k}".lstrip("."))
+            if val is not None:
+                return val, found
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            val, found = _deep_find_amount(v, container_key, amount_key,
+                                           f"{_path}.{i}".lstrip("."))
+            if val is not None:
+                return val, found
+    return None, ""
+
+
+def _shape(obj: Any, depth: int = 3) -> Any:
+    """Keys-only structural description (NO values) — safe to log/show."""
+    if isinstance(obj, dict):
+        if depth <= 0:
+            return {k: "..." for k in obj}
+        return {k: _shape(v, depth - 1) for k, v in obj.items()}
+    if isinstance(obj, list):
+        if not obj:
+            return []
+        head = _shape(obj[0], depth - 1)
+        return [head, f"...(+{len(obj) - 1} more)"] if len(obj) > 1 else [head]
+    return type(obj).__name__
+
+
 # ===========================================================================
 # Batch claim (the polling tick)
 # ===========================================================================
@@ -390,13 +427,25 @@ def _dd_enquiry(s: Session, p: ComplaintProcessing, account: str) -> dict:
 
 
 def _available_balance(s: Session, p: ComplaintProcessing, account: str) -> Decimal:
-    """Balance used for the hold decision = accounts[].currentBalance.amount."""
+    """Balance used for the hold decision. Tries the configured path first;
+    if that misses, deep-searches for BALANCE_FIELD.amount and logs the real
+    path. If nothing is found, raises with the response SHAPE (keys only)."""
     resp = _dd_enquiry(s, p, account)
+
     raw = _dig(resp, config.BALANCE_PATH)
     if raw is None:
+        raw, found_path = _deep_find_amount(resp, config.BALANCE_FIELD)
+        if raw is not None:
+            log.warning(
+                "[%s] balance not at BALANCE_PATH='%s'; found via deep search at "
+                "'%s' — set BALANCE_PATH='%s' to make it explicit.",
+                p.acknowledgement_no, config.BALANCE_PATH, found_path, found_path,
+            )
+    if raw is None:
         raise GatewayError(
-            f"balance not found at path '{config.BALANCE_PATH}' "
-            f"in balance-enquiry response (top keys={list(resp.keys())})"
+            f"balance not found. tried BALANCE_PATH='{config.BALANCE_PATH}' and "
+            f"deep search for '{config.BALANCE_FIELD}.amount'. "
+            f"response shape (keys only) = {_shape(resp)}"
         )
     return Decimal(str(raw))
 
