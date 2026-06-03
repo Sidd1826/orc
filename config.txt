@@ -58,11 +58,13 @@ MAX_ATTEMPTS              = _env_int("MAX_ATTEMPTS", 5)
 MAX_TRACE_LAYERS          = _env_int("MAX_TRACE_LAYERS", 5)
 
 # --- Upstream JSON field paths (CONFIRM against real HSBC contracts) ---
-# --- Balance enquiry: path to the balance amount in the demand-deposit
-#     response. Real HSBC shape is accounts[].currentBalance.amount. Dotted
-#     path supports list indices (e.g. accounts.0...). Switch the last-but-one
-#     segment to availableBalance if you ever need available instead.
-BALANCE_PATH = _env("BALANCE_PATH", "accounts.0.currentBalance.amount")
+# --- Balance enquiry: path to the balance amount in the gateway response.
+#     The gateway wraps the HSBC body under "data", so the real shape is
+#     data.accounts[].currentBalance.amount. Dotted path supports list indices.
+BALANCE_PATH = _env("BALANCE_PATH", "data.accounts.0.currentBalance.amount")
+
+# --- Transaction enquiry: path to the transaction list (also under "data") ---
+TXN_DETAILS_PATH = _env("TXN_DETAILS_PATH", "data.accountInformation.transactionDetails")
 
 # --- Apply-hold mandatory fields ---
 HOLD_TYPE      = _env("HOLD_TYPE", "F")            # per your sample (F)
