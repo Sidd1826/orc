@@ -87,18 +87,21 @@ async def health():
 async def demand_deposit(hubCustomerNumber: str = "", body: Any = Body(default=None)):
     account = _real_account_from_dd(body)
     bal = BALANCES.get(account, DEFAULT_BALANCE) if account else DEFAULT_BALANCE
-    # Real balance-enquiry shape. NOTE availableBalance is intentionally 0 so a
-    # bug that reads availableBalance instead of currentBalance would show up.
+    # Gateway wraps the HSBC body under "data" (same as main.py). availableBalance
+    # is intentionally 0 so a bug reading it instead of currentBalance shows up.
     return {
-        "transactionReferenceNumber": "",
-        "accounts": [{
-            "customerNumber": "INHSBC003297637",
-            "accountNumber": account or "INHSBC003297637006",
-            "accountStatusDesc": "ACTIVE",
-            "currentBalance": {"currencyCode": "INR", "amount": bal},
-            "availableBalance": {"currencyCode": "INR", "amount": 0.000},
-            "_mock_account_seen": account,
-        }],
+        "requestId": str(uuid.uuid4()),
+        "data": {
+            "transactionReferenceNumber": "",
+            "accounts": [{
+                "customerNumber": "INHSBC003297637",
+                "accountNumber": account or "INHSBC003297637006",
+                "accountStatusDesc": "ACTIVE",
+                "currentBalance": {"currencyCode": "INR", "amount": bal},
+                "availableBalance": {"currencyCode": "INR", "amount": 0.000},
+                "_mock_account_seen": account,
+            }],
+        },
     }
 
 
@@ -106,12 +109,15 @@ async def demand_deposit(hubCustomerNumber: str = "", body: Any = Body(default=N
 async def transaction_history(accountNumber: str = "", fromDate: str = "",
                               body: Any = Body(default=None)):
     return {
-        "accountInformation": {
-            "accountCurrencyCode": "INR",
-            "accountNumber": "INHSBC500021738001",
-            "moreTxns": "N",
-            "transactionDetails": [_txn(r) for r in KNOWN_RRNS],
-        }
+        "requestId": str(uuid.uuid4()),
+        "data": {
+            "accountInformation": {
+                "accountCurrencyCode": "INR",
+                "accountNumber": "INHSBC500021738001",
+                "moreTxns": "N",
+                "transactionDetails": [_txn(r) for r in KNOWN_RRNS],
+            }
+        },
     }
 
 
