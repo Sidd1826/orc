@@ -328,7 +328,7 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
         # each incident's transaction by matching its RRN in the narratives.
         from_date = min(i.transaction_date for i in incidents).isoformat()
         resp = _txn_enquiry(s, p, account, from_date)
-        details = _dig(resp, "accountInformation.transactionDetails") or []
+        details = _dig(resp, config.TXN_DETAILS_PATH) or []
         for inc in incidents:
             idem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
             if _step_get(s, p, "DD_TXN", idem):
