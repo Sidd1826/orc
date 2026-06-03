@@ -61,7 +61,10 @@ MAX_TRACE_LAYERS          = _env_int("MAX_TRACE_LAYERS", 5)
 # --- Balance enquiry: path to the balance amount in the gateway response.
 #     The gateway wraps the HSBC body under "data", so the real shape is
 #     data.accounts[].currentBalance.amount. Dotted path supports list indices.
-BALANCE_PATH = _env("BALANCE_PATH", "data.accounts.0.currentBalance.amount")
+#     If the path misses, the code deep-searches for BALANCE_FIELD.amount and
+#     logs the path it found, so you can set BALANCE_PATH precisely.
+BALANCE_PATH  = _env("BALANCE_PATH", "data.accounts.0.currentBalance.amount")
+BALANCE_FIELD = _env("BALANCE_FIELD", "currentBalance")   # deep-search fallback target
 
 # --- Transaction enquiry: path to the transaction list (also under "data") ---
 TXN_DETAILS_PATH = _env("TXN_DETAILS_PATH", "data.accountInformation.transactionDetails")
