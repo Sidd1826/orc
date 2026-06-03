@@ -79,27 +79,54 @@ def _dig(d: Any, path: str) -> Any:
     return cur
 
 
-def _deep_find_amount(obj: Any, container_key: str, amount_key: str = "amount",
-                      _path: str = "") -> tuple[Any, str]:
-    """Find `container_key`.`amount_key` anywhere in a nested dict/list.
-    Returns (value, dotted_path) or (None, "")."""
+def _usable_number(x: Any) -> bool:
+    """True if x is a number or a non-empty numeric string."""
+    if isinstance(x, bool):
+        return False
+    if isinstance(x, (int, float)):
+        return True
+    if isinstance(x, str):
+        try:
+            Decimal(x.strip())
+            return x.strip() != ""
+        except Exception:
+            return False
+    return False
+
+
+def _deep_find_balance(obj: Any, container_key: str, amount_key: str = "amount",
+                       _path: str = "") -> tuple[Any, str]:
+    """Find the balance anywhere in a nested dict/list. Accepts `container_key`
+    as EITHER a scalar (e.g. data.currentBalance = "76.21") OR an object
+    (e.g. ...currentBalance.amount = 76.21). Returns (value, dotted_path)."""
     if isinstance(obj, dict):
-        if (container_key in obj and isinstance(obj[container_key], dict)
-                and amount_key in obj[container_key]):
-            here = f"{_path}.{container_key}.{amount_key}".lstrip(".")
-            return obj[container_key][amount_key], here
-        for k, v in obj.items():
-            val, found = _deep_find_amount(v, container_key, amount_key,
-                                           f"{_path}.{k}".lstrip("."))
-            if val is not None:
-                return val, found
+        if container_key in obj:
+            v = obj[container_key]
+            if isinstance(v, dict) and amount_key in v and _usable_number(v[amount_key]):
+                return v[amount_key], f"{_path}.{container_key}.{amount_key}".lstrip(".")
+            if _usable_number(v):
+                return v, f"{_path}.{container_key}".lstrip(".")
+        for k, val in obj.items():
+            r, fp = _deep_find_balance(val, container_key, amount_key,
+                                       f"{_path}.{k}".lstrip("."))
+            if r is not None:
+                return r, fp
     elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            val, found = _deep_find_amount(v, container_key, amount_key,
-                                           f"{_path}.{i}".lstrip("."))
-            if val is not None:
-                return val, found
+        for i, val in enumerate(obj):
+            r, fp = _deep_find_balance(val, container_key, amount_key,
+                                       f"{_path}.{i}".lstrip("."))
+            if r is not None:
+                return r, fp
     return None, ""
+
+
+def _coerce_balance(x: Any) -> Optional[Decimal]:
+    if x is None:
+        return None
+    try:
+        return Decimal(str(x).strip())
+    except Exception:
+        return None
 
 
 def _shape(obj: Any, depth: int = 3) -> Any:
@@ -428,26 +455,28 @@ def _dd_enquiry(s: Session, p: ComplaintProcessing, account: str) -> dict:
 
 def _available_balance(s: Session, p: ComplaintProcessing, account: str) -> Decimal:
     """Balance used for the hold decision. Tries the configured path first;
-    if that misses, deep-searches for BALANCE_FIELD.amount and logs the real
-    path. If nothing is found, raises with the response SHAPE (keys only)."""
+    if that misses, deep-searches for BALANCE_FIELD (accepting either a scalar
+    or an {amount} object) and logs the real path. Raises with the response
+    SHAPE (keys only) if nothing usable is found."""
     resp = _dd_enquiry(s, p, account)
 
-    raw = _dig(resp, config.BALANCE_PATH)
-    if raw is None:
-        raw, found_path = _deep_find_amount(resp, config.BALANCE_FIELD)
-        if raw is not None:
+    bal = _coerce_balance(_dig(resp, config.BALANCE_PATH))
+    if bal is None:
+        found, found_path = _deep_find_balance(resp, config.BALANCE_FIELD)
+        bal = _coerce_balance(found)
+        if bal is not None:
             log.warning(
                 "[%s] balance not at BALANCE_PATH='%s'; found via deep search at "
                 "'%s' — set BALANCE_PATH='%s' to make it explicit.",
                 p.acknowledgement_no, config.BALANCE_PATH, found_path, found_path,
             )
-    if raw is None:
+    if bal is None:
         raise GatewayError(
             f"balance not found. tried BALANCE_PATH='{config.BALANCE_PATH}' and "
-            f"deep search for '{config.BALANCE_FIELD}.amount'. "
+            f"deep search for '{config.BALANCE_FIELD}'. "
             f"response shape (keys only) = {_shape(resp)}"
         )
-    return Decimal(str(raw))
+    return bal
 
 
 def _bq_locate(s: Session, p: ComplaintProcessing, account: str, inc: Incident) -> dict:
