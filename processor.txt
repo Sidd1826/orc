@@ -563,6 +563,10 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
     # 1. Pull the account's outgoing/debit transactions from CBDOC (one query,
     #    equality filter on the account field; client-side sort + accumulate).
     rows = _cbdoc_account_debits(s, p, account)
+    if not rows:
+        # Diagnose: log how CBDOC stores this fraud txn so the account field can
+        # be mapped correctly. Reconciliation will report 0 until that's set.
+        _cbdoc_probe(s, p, incidents)
 
     # 2. Identify the fraud transactions by reference number (the incident RRNs),
     #    to anchor the starting point of the walk.
@@ -599,17 +603,50 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
 
 def _cbdoc_account_debits(s: Session, p: ComplaintProcessing, account: str) -> list[dict]:
     """Fetch the account's debit transactions from CBDOC (cached per complaint).
-    NOTE: filters on BQ_FIELD_ACCOUNT — set that env var to the CBDOC column
-    that holds the DEBITED (originating) account. The OG* table is outgoing
-    payments, so each row is a debit from that account."""
+    Filters on BQ_FIELD_ACCOUNT — set that env var to the CBDOC column that holds
+    the DEBITED (originating) account. On 0 rows, runs a diagnostic probe."""
     idem = f"CBDOCDEBITS:{p.acknowledgement_no}:{account}"
     existing = _step_get(s, p, "BQ_TRACE", idem)
     if existing and existing.status == "SUCCESS":
         return _rows(existing.response_payload or {})
-    resp = gateway().bigquery_search({config.BQ_FIELD_ACCOUNT: account},
-                                     limit=config.CBDOC_MAX_ROWS)
-    _step_record(s, p, "BQ_TRACE", idem, {"account": account}, resp)
-    return _rows(resp)
+
+    filt = {config.BQ_FIELD_ACCOUNT: account}
+    log.info("[%s] CBDOC account search: field BQ_FIELD_ACCOUNT=%s value=%s",
+             p.acknowledgement_no, config.BQ_FIELD_ACCOUNT, account)
+    resp = gateway().bigquery_search(filt, limit=config.CBDOC_MAX_ROWS)
+    rows = _rows(resp)
+    _step_record(s, p, "BQ_TRACE", idem, filt, resp)
+    log.info("[%s] CBDOC account search returned %d rows", p.acknowledgement_no, len(rows))
+    return rows
+
+
+def _cbdoc_probe(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> None:
+    """Diagnostic: when the account search returns nothing, locate the fraud
+    transaction by its reference number and LOG that row's fields. This reveals
+    how CBDOC actually stores the account so you can set BQ_FIELD_ACCOUNT (and
+    the correct account value) — the single mapping this reconciliation needs."""
+    for inc in incidents:
+        try:
+            resp = gateway().bigquery_search({config.BQ_FIELD_REF: inc.merchant_id}, limit=5)
+        except Exception as e:                      # noqa: BLE001
+            log.warning("[%s] CBDOC probe by %s=%s failed: %s",
+                        p.acknowledgement_no, config.BQ_FIELD_REF, inc.merchant_id, e)
+            continue
+        rows = _rows(resp)
+        log.warning("[%s] CBDOC probe %s=%s -> %d rows",
+                    p.acknowledgement_no, config.BQ_FIELD_REF, inc.merchant_id, len(rows))
+        if rows:
+            log.warning("[%s] CBDOC fraud row fields = %s",
+                        p.acknowledgement_no, {k: rows[0].get(k) for k in rows[0]})
+            log.warning("[%s] ACTION: set BQ_FIELD_ACCOUNT to whichever field above holds the "
+                        "account whose debits you want, and make sure the complaint's "
+                        "payer_account_number matches that stored value/format.",
+                        p.acknowledgement_no)
+            return
+    log.warning("[%s] CBDOC probe found nothing even by reference number — confirm the fraud "
+                "ref (incident 'm'=%s) matches CBDOC's %s and that data exists for it.",
+                p.acknowledgement_no,
+                incidents[0].merchant_id if incidents else "?", config.BQ_FIELD_REF)
 
 
 def _rows(bq_resp: dict) -> list[dict]:
