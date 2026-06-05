@@ -28,6 +28,8 @@ BALANCES: dict[str, str] = {
     "ACC-PART-0001": "20.00",
     "ACC-PART-0002": "20.00",
     "ACC-ZERO-0001": "0.00",
+    "ACC-DEMO-MULTI": "100.00",   # multi-incident demo: disputed 500 -> hold 100
+    "9987868786777": "20.00",     # sample-complaint account -> partial hold -> reconcile
 }
 DEFAULT_BALANCE = os.getenv("MOCK_AVAILABLE_BALANCE", "100000.00")
 
@@ -35,8 +37,11 @@ ACCOUNT_TRACE: dict[str, float] = {
     "ACC-PART-0001": 1000.00,
     "ACC-PART-0002": 5.00,
     "ACC-ZERO-0001": 1000.00,
+    "ACC-DEMO-MULTI": 450.00,     # 3 debit legs of 150 -> reconciles remaining 400
 }
-DEFAULT_TRACE = float(os.getenv("MOCK_TRACE_AMOUNT", "0") or 0)
+# Unknown accounts get this many "recoverable" rupees of debits so reconcile
+# works out of the box. Set MOCK_TRACE_AMOUNT=0 to force the not-found path.
+DEFAULT_TRACE = float(os.getenv("MOCK_TRACE_AMOUNT", "1000") or 0)
 
 TERMINAL_PAYEE = "00000033082900137"
 BQ_FIELD_ACCOUNT = "OGBEAC"
@@ -139,27 +144,28 @@ async def upi_secure(payload: dict = Body(...)):
 
 @app.post("/api/v1/search")
 async def search(body: dict = Body(...)):
-    account = body.get(BQ_FIELD_ACCOUNT)
-    total = ACCOUNT_TRACE.get(account, DEFAULT_TRACE) if account else DEFAULT_TRACE
-
-    # Ref-based probe (debug endpoint / _cbdoc_probe): echo a sample fraud row so
-    # you can see how fields look. Real CBDOC would return the actual row.
-    if not total and body.get("OGTRNO"):
-        row = {"OGTRNO": body["OGTRNO"], "OGBEAC": TERMINAL_PAYEE, "OGBEA1": "MOCK PAYEE",
+    # (a) Ref-only probe (debug endpoint / _cbdoc_probe): echo a sample fraud row.
+    if body.get("OGTRNO") and not body.get(BQ_FIELD_ACCOUNT):
+        row = {"OGTRNO": body["OGTRNO"], "OGBEAC": "9987868786777", "OGBEA1": "MOCK PAYEE",
                "OGT521": "ORDERING ACCT 500021738001", "OGPYAM": 35.00,
                "OGCPDT": 20260601, "OGCPTM": 150200, "OGPYCY": "INR", "OGNAR1": "probe"}
         return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": 1, "rows": [row]}
 
+    # (b) Account search: return the account's debit legs. Unknown accounts get
+    #     DEFAULT_TRACE (non-zero) so reconciliation works out of the box; map an
+    #     account in ACCOUNT_TRACE to a small/zero value to test shortfalls.
+    account = body.get(BQ_FIELD_ACCOUNT)
+    total = ACCOUNT_TRACE.get(account, DEFAULT_TRACE) if account else 0
     if not total:
         return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": 0, "rows": []}
 
     legs = [round(total / 3, 2), round(total / 3, 2), round(total - 2 * round(total / 3, 2), 2)]
-    refs = ["244444440005", "900000000001", "900000000002"]   # first = a fraud RRN
+    refs = ["244444444444", "900000000001", "900000000002"]   # first = the fraud RRN
     rows = []
     for i, (amt, ref) in enumerate(zip(legs, refs)):
         rows.append({
-            "OGTRNO": ref, "OGBEAC": TERMINAL_PAYEE, "OGBEA1": f"MOCK PAYEE {i+1}",
-            "OGPYAM": float(amt), "OGCPDT": 20260601, "OGCPTM": 150200 + i,
+            "OGTRNO": ref, "OGBEAC": account, "OGBEA1": f"MOCK PAYEE {i+1}",
+            "OGPYAM": float(amt), "OGCPDT": 20230102, "OGCPTM": 150200 + i,
             "OGPYCY": "INR", "OGNAR1": f"leg {i+1}",
         })
     return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": len(rows), "rows": rows}
