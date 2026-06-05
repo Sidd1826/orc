@@ -476,6 +476,7 @@ def _available_balance(s: Session, p: ComplaintProcessing, account: str) -> Deci
             f"deep search for '{config.BALANCE_FIELD}'. "
             f"response shape (keys only) = {_shape(resp)}"
         )
+    _stash(s, p, "BALANCE", {"value": str(bal)})   # for root_effective_balance
     return bal
 
 
@@ -585,11 +586,13 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
 
     collected: list[dict] = []
     recovered = Decimal("0")
+    root = _root_ctx(s, p)
+    disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
     for row in rows[start:]:
         amt = _row_amount(row)
         if amt <= 0:                      # skip non-debits / zero rows
             continue
-        collected.append(_to_mha_txn(row))
+        collected.append(_to_mha_txn(row, root, disputed))
         recovered += amt
         if recovered >= remaining:        # reconciled — include this last one and stop
             break
@@ -671,22 +674,47 @@ def _row_dt_key(row: dict) -> tuple[int, int]:
     return (_int(row.get(config.BQ_FIELD_DATE)), _int(row.get(config.BQ_FIELD_TIME)))
 
 
-def _to_mha_txn(row: dict) -> dict:
-    """Map a CBDOC/BigQuery row into the MHA response transaction shape.
-    Field mapping is best-effort against the OG* whitelist — refine to your
-    exact CBDOC columns as needed."""
+def _root_ctx(s: Session, p: ComplaintProcessing) -> dict:
+    """The 'root' = the original fraud account + first incident's RRN + the
+    account's balance. Shared across every response object."""
+    inst = p.complaint.instrument
+    incs = inst.incidents if inst else []
+    primary = incs[0] if incs else None
     return {
-        "rrn_transaction_id": row.get(config.BQ_FIELD_REF),
-        "payee_account_number": row.get(config.BQ_FIELD_BENE_ACCOUNT),
-        "payee_name": row.get("OGBEA1"),
+        "root_account_number": inst.payer_account_number if inst else "",
+        "root_rrn_transaction_id": (primary.merchant_id if primary else ""),
+        "root_bankid": (inst.payer_bank_code if inst else "") or "",
+        "root_effective_balance": _unstash(s, p, "BALANCE").get("value", ""),
+        "root_ifsc_code": "",          # TODO: source IFSC of the root account
+    }
+
+
+# Fields we don't yet have a source for are emitted as "" so the JSON shape is
+# complete. Wire them up once you confirm where they come from (transaction
+# enquiry narratives, a customer-info service, or extra CBDOC columns).
+def _to_mha_txn(row: dict, root: dict, disputed: Decimal) -> dict:
+    """A CBDOC debit leg -> MHA 'Money Transfer To' object (txn_type_id 3)."""
+    return {
+        "rrn_transaction_id": row.get(config.BQ_FIELD_REF, ""),
+        "payee_bank": row.get("OGBEA1", ""),            # best-effort from bene name/addr
+        "payee_bank_code": "",
+        "payee_account_number": row.get(config.BQ_FIELD_BENE_ACCOUNT, ""),
         "amount": str(row.get(config.BQ_FIELD_AMOUNT, "")),
-        "currency": row.get("OGPYCY"),
-        "transaction_datetime": _fmt_dt(row.get(config.BQ_FIELD_DATE), row.get(config.BQ_FIELD_TIME)),
+        "transaction_datetime": _fmt_dt(row.get(config.BQ_FIELD_DATE), row.get(config.BQ_FIELD_TIME)) or "",
+        "disputed_amount": str(disputed),
+        "ifsc_code": "",
         "txn_type": "Money Transfer To",
         "txn_type_id": "3",
+        "phone_number": "",
+        "email": "",
+        "pan_number": "",
+        "root_account_number": root["root_account_number"],
+        "root_rrn_transaction_id": root["root_rrn_transaction_id"],
+        "root_bankid": root["root_bankid"],
         "status_code": "00",
-        "narratives": [row.get(k) for k in ("OGNAR1", "OGNAR2", "OGNAR3", "OGNAR4") if row.get(k)],
-        "_raw": row,
+        "remarks": row.get("OGNAR1", "") or "",
+        "root_effective_balance": root["root_effective_balance"],
+        "root_ifsc_code": root["root_ifsc_code"],
     }
 
 
@@ -706,8 +734,9 @@ def _fmt_dt(d: Any, t: Any) -> Optional[str]:
 # Finalise — write the MHA-facing response row
 # ===========================================================================
 
-def _hold_txns(s: Session, p: ComplaintProcessing) -> list[dict]:
-    """Emit applied holds in the MHA 'Put on Hold' transaction shape."""
+def _hold_txns(s: Session, p: ComplaintProcessing, root: dict) -> list[dict]:
+    """Applied holds -> MHA 'Transaction Put on Hold' objects (txn_type_id 1).
+    One object per hold."""
     rows = s.execute(
         select(ProcessingStep).where(
             ProcessingStep.complaint_id == p.complaint_id,
@@ -719,66 +748,69 @@ def _hold_txns(s: Session, p: ComplaintProcessing) -> list[dict]:
     for r in rows:
         req = r.request_payload or {}
         out.append({
-            "root_account_number": req.get("account"),
-            "amount": req.get("amount"),
+            "root_account_number": req.get("account", root["root_account_number"]),
+            "root_rrn_transaction_id": root["root_rrn_transaction_id"],
+            "root_bankid": root["root_bankid"],
+            "ifsc_code": "",
+            "amount": req.get("amount", ""),
+            "transaction_datetime": "",
+            "phone_number": "",
+            "email": "",
+            "pan_number": "",
+            "remarks": "",
             "txn_type": "Transaction Put on Hold",
             "txn_type_id": "1",
             "status_code": "00",
-            "hold_response": r.response_payload,
-        })
-    return out
-
-
-def _dd_txn_entries(s: Session, p: ComplaintProcessing) -> list[dict]:
-    """Transaction-enquiry matches (one per incident found by RRN), shaped for
-    the MHA response. Narratives carry the beneficiary chain — exact field
-    parsing (which narrative is bene acct vs IFSC) depends on HSBC's spec."""
-    rows = s.execute(
-        select(ProcessingStep).where(
-            ProcessingStep.complaint_id == p.complaint_id,
-            ProcessingStep.step == "DD_TXN",
-            ProcessingStep.status == "SUCCESS",
-        )
-    ).scalars().all()
-    out = []
-    for r in rows:
-        rp = r.response_payload or {}
-        if not rp.get("found"):
-            continue
-        txn = rp.get("matched") or {}
-        out.append({
-            "txn_type": "Transaction Details",
-            "rrn_transaction_id": (r.request_payload or {}).get("rrn"),
-            "amount": _dig(txn, "transactionAmount.amount"),
-            "currency": _dig(txn, "transactionAmount.currency"),
-            "post_date": txn.get("postDate"),
-            "post_status": txn.get("postStatusDescription"),
-            "narratives": _narratives(txn),
-            "status_code": "00",
+            "root_effective_balance": root["root_effective_balance"],
+            "root_ifsc_code": root["root_ifsc_code"],
         })
     return out
 
 
 def _finalize(s: Session, p: ComplaintProcessing, instrument: Instrument,
               incidents: list[Incident], traced_txns: list[dict]) -> None:
+    """transactions = one 'Transaction Put on Hold' per hold + one 'Money
+    Transfer To' per traced CBDOC debit (already built with root context)."""
+    root = _root_ctx(s, p)
     payload = {
         "acknowledgement_no": p.acknowledgement_no,
         "job_id": p.job_id,
-        "transactions": _hold_txns(s, p) + _dd_txn_entries(s, p) + traced_txns,
+        "transactions": _hold_txns(s, p, root) + traced_txns,
     }
     _write_response_log(s, p, payload)
 
 
 def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> None:
+    """UPI-debit: one 'Money Transfer To' per incident, populated from the UPI
+    beneficiary lookup."""
+    root = _root_ctx(s, p)
+    disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
     txns = []
     for inc in incidents:
         step = _step_get(s, p, "UPI_BENE", f"UPI:{p.acknowledgement_no}:{inc.merchant_id}")
+        bene = _dig(step.response_payload, "data") if step and step.response_payload else {}
+        bene = bene or {}
         txns.append({
             "rrn_transaction_id": inc.merchant_id,
+            "payee_bank": bene.get("bankName", ""),
+            "payee_bank_code": "",
+            "payee_account_number": bene.get("beneficiaryAccount", ""),
             "amount": str(inc.amount),
-            "txn_type": "Beneficiary Lookup",
+            "transaction_datetime": f"{inc.transaction_date} {inc.transaction_time}",
+            "disputed_amount": str(inc.disputed_amount),
+            "ifsc_code": bene.get("ifsc", ""),
+            "txn_type": "Money Transfer To",
+            "txn_type_id": "3",
+            "phone_number": "",
+            "email": "",
+            "pan_number": "",
+            "root_account_number": root["root_account_number"],
+            "root_rrn_transaction_id": root["root_rrn_transaction_id"],
+            "root_bankid": root["root_bankid"],
             "status_code": "00",
-            "bene": (step.response_payload if step else None),
+            "remarks": "",
+            "root_effective_balance": root["root_effective_balance"],
+            "root_ifsc_code": root["root_ifsc_code"],
         })
     _write_response_log(s, p, {
         "acknowledgement_no": p.acknowledgement_no,
