@@ -303,7 +303,7 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
             _finalize(s, p, instrument, incidents, traced_txns=traced)
             p.processing_state = ST_RESOLVED if reconciled else ST_NEEDS_REVIEW
             if not reconciled:
-                p.last_error = "could not fully reconcile within trace-layer cap"
+                p.last_error = "CBDOC account debits did not reconcile the disputed amount"
             p.lease_expires_at = None
             s.add(p); s.commit()
             break
@@ -549,55 +549,67 @@ def _apply_holds(s: Session, p: ComplaintProcessing, instrument: Instrument,
 
 def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incident],
                        remaining: Decimal) -> tuple[list[dict], bool]:
-    """Walk the CBDOC money trail up to MAX_TRACE_LAYERS, collecting every
-    debited transaction. Returns (collected_transactions, fully_reconciled)."""
+    """Account-centric CBDOC reconciliation.
+
+    When a hold couldn't cover the disputed amount (partial hold, or no balance),
+    we go to CBDOC, anchor on the fraud transaction by its reference number, then
+    walk the account's DEBITS in chronological order from that point, collecting
+    every debit until the outstanding `remaining` amount is reconciled. ALL the
+    collected debits go back to MHA.
+
+    Returns (collected_transactions, fully_reconciled)."""
+    account = p.complaint.instrument.payer_account_number
+
+    # 1. Pull the account's outgoing/debit transactions from CBDOC (one query,
+    #    equality filter on the account field; client-side sort + accumulate).
+    rows = _cbdoc_account_debits(s, p, account)
+
+    # 2. Identify the fraud transactions by reference number (the incident RRNs),
+    #    to anchor the starting point of the walk.
+    fraud_refs = {inc.merchant_id for inc in incidents}
+
+    # 3. Sort chronologically (capture date + time ascending).
+    rows = sorted(rows, key=_row_dt_key)
+
+    # 4. Start collecting from the FIRST row that matches a fraud ref (the fraud
+    #    transaction). If none matches, start from the beginning (collect all).
+    start = 0
+    for i, row in enumerate(rows):
+        if str(row.get(config.BQ_FIELD_REF, "")).strip() in fraud_refs:
+            start = i
+            break
+
     collected: list[dict] = []
     recovered = Decimal("0")
-    seen_accounts: set[str] = set()
-
-    # Seed the frontier with the beneficiary account(s) of the fraud incidents.
-    frontier: list[str] = []
-    for inc in incidents:
-        bq = _bq_locate(s, p, _seed_account(p), inc)
-        for row in _rows(bq):
-            collected.append(_to_mha_txn(row))
-            recovered += _row_amount(row)
-            nxt = row.get(config.BQ_FIELD_BENE_ACCOUNT)
-            if nxt and str(nxt) not in seen_accounts:
-                frontier.append(str(nxt))
-
-    layer = 1
-    while frontier and recovered < remaining and layer <= config.MAX_TRACE_LAYERS:
-        next_frontier: list[str] = []
-        for acct in frontier:
-            if acct in seen_accounts:        # already traced — avoid loops/double-count
-                continue
-            seen_accounts.add(acct)
-            idem = f"BQLAYER:{p.acknowledgement_no}:{layer}:{acct}"
-            existing = _step_get(s, p, "BQ_TRACE", idem)
-            if existing and existing.status == "SUCCESS":
-                resp = existing.response_payload or {}
-            else:
-                resp = gateway().bigquery_search(
-                    {config.BQ_FIELD_ACCOUNT: acct}, limit=200)
-                _step_record(s, p, "BQ_TRACE", idem, {"account": acct, "layer": layer}, resp)
-            for row in _rows(resp):
-                collected.append(_to_mha_txn(row, layer=layer))
-                recovered += _row_amount(row)
-                nxt = row.get(config.BQ_FIELD_BENE_ACCOUNT)
-                if nxt and str(nxt) not in seen_accounts:
-                    next_frontier.append(str(nxt))
-        frontier = next_frontier
-        layer += 1
+    for row in rows[start:]:
+        amt = _row_amount(row)
+        if amt <= 0:                      # skip non-debits / zero rows
+            continue
+        collected.append(_to_mha_txn(row))
+        recovered += amt
+        if recovered >= remaining:        # reconciled — include this last one and stop
+            break
 
     fully = recovered >= remaining
-    log.info("[%s] trace done layers=%d collected=%d recovered=%s remaining=%s reconciled=%s",
-             p.acknowledgement_no, layer - 1, len(collected), recovered, remaining, fully)
+    log.info("[%s] CBDOC reconcile: account debits=%d collected=%d recovered=%s "
+             "remaining=%s reconciled=%s",
+             p.acknowledgement_no, len(rows), len(collected), recovered, remaining, fully)
     return collected, fully
 
 
-def _seed_account(p: ComplaintProcessing) -> str:
-    return p.complaint.instrument.payer_account_number
+def _cbdoc_account_debits(s: Session, p: ComplaintProcessing, account: str) -> list[dict]:
+    """Fetch the account's debit transactions from CBDOC (cached per complaint).
+    NOTE: filters on BQ_FIELD_ACCOUNT — set that env var to the CBDOC column
+    that holds the DEBITED (originating) account. The OG* table is outgoing
+    payments, so each row is a debit from that account."""
+    idem = f"CBDOCDEBITS:{p.acknowledgement_no}:{account}"
+    existing = _step_get(s, p, "BQ_TRACE", idem)
+    if existing and existing.status == "SUCCESS":
+        return _rows(existing.response_payload or {})
+    resp = gateway().bigquery_search({config.BQ_FIELD_ACCOUNT: account},
+                                     limit=config.CBDOC_MAX_ROWS)
+    _step_record(s, p, "BQ_TRACE", idem, {"account": account}, resp)
+    return _rows(resp)
 
 
 def _rows(bq_resp: dict) -> list[dict]:
@@ -607,23 +619,36 @@ def _rows(bq_resp: dict) -> list[dict]:
 def _row_amount(row: dict) -> Decimal:
     raw = row.get(config.BQ_FIELD_AMOUNT)
     try:
-        return Decimal(str(raw)) if raw is not None else Decimal("0")
+        return abs(Decimal(str(raw))) if raw is not None else Decimal("0")
     except Exception:
         return Decimal("0")
 
 
-def _to_mha_txn(row: dict, layer: int = 0) -> dict:
+def _row_dt_key(row: dict) -> tuple[int, int]:
+    """Sort key: capture date then capture time (ints), 0 if missing."""
+    def _int(v):
+        try:
+            return int(v)
+        except Exception:
+            return 0
+    return (_int(row.get(config.BQ_FIELD_DATE)), _int(row.get(config.BQ_FIELD_TIME)))
+
+
+def _to_mha_txn(row: dict) -> dict:
     """Map a CBDOC/BigQuery row into the MHA response transaction shape.
-    Field mapping is best-effort against the OG* whitelist — confirm & refine."""
+    Field mapping is best-effort against the OG* whitelist — refine to your
+    exact CBDOC columns as needed."""
     return {
         "rrn_transaction_id": row.get(config.BQ_FIELD_REF),
         "payee_account_number": row.get(config.BQ_FIELD_BENE_ACCOUNT),
         "payee_name": row.get("OGBEA1"),
         "amount": str(row.get(config.BQ_FIELD_AMOUNT, "")),
-        "transaction_datetime": _fmt_dt(row.get(config.BQ_FIELD_DATE), row.get("OGCPTM")),
+        "currency": row.get("OGPYCY"),
+        "transaction_datetime": _fmt_dt(row.get(config.BQ_FIELD_DATE), row.get(config.BQ_FIELD_TIME)),
         "txn_type": "Money Transfer To",
+        "txn_type_id": "3",
         "status_code": "00",
-        "layer": layer,
+        "narratives": [row.get(k) for k in ("OGNAR1", "OGNAR2", "OGNAR3", "OGNAR4") if row.get(k)],
         "_raw": row,
     }
 

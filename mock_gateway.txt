@@ -140,11 +140,24 @@ async def upi_secure(payload: dict = Body(...)):
 @app.post("/api/v1/search")
 async def search(body: dict = Body(...)):
     account = body.get(BQ_FIELD_ACCOUNT)
-    amount = ACCOUNT_TRACE.get(account, DEFAULT_TRACE) if account else DEFAULT_TRACE
-    if not amount:
+    total = ACCOUNT_TRACE.get(account, DEFAULT_TRACE) if account else DEFAULT_TRACE
+    if not total:
         return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": 0, "rows": []}
-    row = {
-        "OGTRNO": "244444444444", "OGBEAC": TERMINAL_PAYEE, "OGBEA1": "MOCK PAYEE",
-        "OGPYAM": float(amount), "OGCPDT": 20260601, "OGCPTM": 150200, "OGPYCY": "INR",
-    }
-    return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": 1, "rows": [row]}
+    # Return several debit rows for the account, chronological, so the
+    # orchestrator accumulates them until reconciled. One row carries a fraud RRN
+    # so the walk can anchor on it. Amounts sum to `total`.
+    legs = [round(total / 3, 2), round(total / 3, 2), round(total - 2 * round(total / 3, 2), 2)]
+    refs = ["244444440005", "900000000001", "900000000002"]   # first = a fraud RRN
+    rows = []
+    for i, (amt, ref) in enumerate(zip(legs, refs)):
+        rows.append({
+            "OGTRNO": ref,
+            "OGBEAC": TERMINAL_PAYEE,
+            "OGBEA1": f"MOCK PAYEE {i+1}",
+            "OGPYAM": float(amt),
+            "OGCPDT": 20260601,
+            "OGCPTM": 150200 + i,
+            "OGPYCY": "INR",
+            "OGNAR1": f"leg {i+1}",
+        })
+    return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": len(rows), "rows": rows}

@@ -78,5 +78,11 @@ HOLD_CURRENCY  = _env("HOLD_CURRENCY", "INR")
 BQ_FIELD_REF          = _env("BQ_FIELD_REF", "OGTRNO")
 BQ_FIELD_AMOUNT       = _env("BQ_FIELD_AMOUNT", "OGPYAM")
 BQ_FIELD_DATE         = _env("BQ_FIELD_DATE", "OGCPDT")
+BQ_FIELD_TIME         = _env("BQ_FIELD_TIME", "OGCPTM")
+# IMPORTANT: BQ_FIELD_ACCOUNT must be the CBDOC column for the DEBITED
+# (originating) account — the one we collect debits FROM. The OG* whitelist is
+# beneficiary-centric, so confirm which column actually holds the source account
+# and set this accordingly.
 BQ_FIELD_ACCOUNT      = _env("BQ_FIELD_ACCOUNT", "OGBEAC")
 BQ_FIELD_BENE_ACCOUNT = _env("BQ_FIELD_BENE_ACCOUNT", "OGBEAC")
+CBDOC_MAX_ROWS        = _env_int("CBDOC_MAX_ROWS", 500)
