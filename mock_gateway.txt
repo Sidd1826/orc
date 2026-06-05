@@ -141,23 +141,25 @@ async def upi_secure(payload: dict = Body(...)):
 async def search(body: dict = Body(...)):
     account = body.get(BQ_FIELD_ACCOUNT)
     total = ACCOUNT_TRACE.get(account, DEFAULT_TRACE) if account else DEFAULT_TRACE
+
+    # Ref-based probe (debug endpoint / _cbdoc_probe): echo a sample fraud row so
+    # you can see how fields look. Real CBDOC would return the actual row.
+    if not total and body.get("OGTRNO"):
+        row = {"OGTRNO": body["OGTRNO"], "OGBEAC": TERMINAL_PAYEE, "OGBEA1": "MOCK PAYEE",
+               "OGT521": "ORDERING ACCT 500021738001", "OGPYAM": 35.00,
+               "OGCPDT": 20260601, "OGCPTM": 150200, "OGPYCY": "INR", "OGNAR1": "probe"}
+        return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": 1, "rows": [row]}
+
     if not total:
         return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": 0, "rows": []}
-    # Return several debit rows for the account, chronological, so the
-    # orchestrator accumulates them until reconciled. One row carries a fraud RRN
-    # so the walk can anchor on it. Amounts sum to `total`.
+
     legs = [round(total / 3, 2), round(total / 3, 2), round(total - 2 * round(total / 3, 2), 2)]
     refs = ["244444440005", "900000000001", "900000000002"]   # first = a fraud RRN
     rows = []
     for i, (amt, ref) in enumerate(zip(legs, refs)):
         rows.append({
-            "OGTRNO": ref,
-            "OGBEAC": TERMINAL_PAYEE,
-            "OGBEA1": f"MOCK PAYEE {i+1}",
-            "OGPYAM": float(amt),
-            "OGCPDT": 20260601,
-            "OGCPTM": 150200 + i,
-            "OGPYCY": "INR",
-            "OGNAR1": f"leg {i+1}",
+            "OGTRNO": ref, "OGBEAC": TERMINAL_PAYEE, "OGBEA1": f"MOCK PAYEE {i+1}",
+            "OGPYAM": float(amt), "OGCPDT": 20260601, "OGCPTM": 150200 + i,
+            "OGPYCY": "INR", "OGNAR1": f"leg {i+1}",
         })
     return {"requestId": str(uuid.uuid4()), "filters_used": body, "row_count": len(rows), "rows": rows}
