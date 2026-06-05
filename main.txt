@@ -198,6 +198,22 @@ async def get_complaint(ack_no: str):
     return data
 
 
+@app.post("/debug/cbdoc-search", tags=["Debug"])
+async def debug_cbdoc_search(filters: dict = Body(
+    ..., examples=[{"OGTRNO": "615213679588"}, {"OGBEAC": "INHSBC500021738001"}])):
+    """Run a raw CBDOC/BigQuery search with whatever filters you pass and return
+    the row count + the first row's full fields. Use this to discover which
+    column holds the account and what value/format CBDOC stores, then set
+    BQ_FIELD_ACCOUNT accordingly. Only whitelisted fields are honoured by the
+    gateway; unknown fields are ignored (which returns unfiltered rows)."""
+    def _run():
+        resp = processor.gateway().bigquery_search(filters, limit=20)
+        rows = resp.get("rows", []) if isinstance(resp, dict) else []
+        return {"filters_sent": filters, "row_count": len(rows),
+                "first_row": rows[0] if rows else None}
+    return await asyncio.to_thread(_run)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0",
