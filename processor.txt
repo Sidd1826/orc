@@ -371,9 +371,18 @@ def _unstash(s: Session, p: ComplaintProcessing, name: str) -> dict:
 def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
             incidents: list[Incident]) -> None:
     """Fetch beneficiary / transaction context: UPI bene, live transaction
-    enquiry (< 24h), or CBDOC/BigQuery (> 24h)."""
+    enquiry (< 24h), or CBDOC/BigQuery (> 24h).
+
+    Scenarios table:
+      UPI Debit any age      → UPI API only (no hold)
+      IB/UPI Credit < 24h    → DD transaction enquiry → balance → hold
+      IB/UPI Credit > 24h    → CBDOC locate → balance → hold
+      IB Debit < 24h         → DD transaction enquiry → balance → hold
+      IB Debit > 24h         → CBDOC locate → UPI API if txn is UPI → balance → hold
+    """
     account = instrument.payer_account_number
 
+    # --- UPI Debit: short-circuit, bene lookup only, no hold ---
     if cls.channel == CHANNEL_UPI and cls.direction == DIR_DEBIT:
         for inc in incidents:
             idem = f"UPI:{p.acknowledgement_no}:{inc.merchant_id}"
@@ -388,8 +397,7 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
         return
 
     if cls.is_recent:
-        # Transaction enquiry: fetch the account's transactions once, then find
-        # each incident's transaction by matching its RRN in the narratives.
+        # < 24h: live DD transaction enquiry, match fraud txn by RRN in narratives
         from_date = min(i.transaction_date for i in incidents).isoformat()
         resp = _txn_enquiry(s, p, account, from_date)
         details = _dig(resp, config.TXN_DETAILS_PATH) or []
@@ -405,8 +413,76 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
                 log.warning("[%s] no transaction matched RRN=%s in enquiry",
                             p.acknowledgement_no, inc.merchant_id)
     else:
-        for inc in incidents:                   # CBDOC / BigQuery archive
-            _bq_locate(s, p, account, inc)
+        # > 24h: CBDOC/BigQuery archive
+        for inc in incidents:
+            bq_resp = _bq_locate(s, p, account, inc)
+
+            # --- IB Debit > 24h: additionally call UPI API if required ---
+            # "If required" = the CBDOC row indicates this was a UPI transaction.
+            # Detected by checking narratives for "UPI" or a UPI VPA format.
+            # Only fires for DEBIT direction (Credit path doesn't need bene lookup).
+            if cls.direction == DIR_DEBIT:
+                rows = _rows(bq_resp)
+                bq_row = rows[0] if rows else {}
+                if _is_upi_txn(bq_row, inc):
+                    _upi_bene_if_required(s, p, inc, account)
+
+
+def _is_upi_txn(bq_row: dict, inc: Incident) -> bool:
+    """Decide if a CBDOC row represents a UPI transaction.
+    Checks narratives (OGNARx) for 'UPI' keyword or a UPI VPA pattern (x@y).
+    Also checks the incident's merchant_id — UPI RRNs are typically 12 digits.
+    Override by setting UPI_DETECT=false in env to skip this check entirely."""
+    if not config.UPI_DETECT:
+        return False
+
+    # Check CBDOC narrative fields for UPI indicators
+    for field in ("OGNAR1", "OGNAR2", "OGNAR3", "OGNAR4", "OGTMZ1"):
+        val = str(bq_row.get(field) or "").upper()
+        if "UPI" in val:
+            log.info("UPI detected in CBDOC field %s='%s'", field, val)
+            return True
+        # UPI VPA pattern: something@something (e.g. user@oksbi)
+        if "@" in val and len(val.split("@")) == 2:
+            log.info("UPI VPA detected in CBDOC field %s='%s'", field, val)
+            return True
+
+    # 12-digit numeric RRN is a strong UPI indicator
+    rrn = str(inc.merchant_id or "").strip()
+    if rrn.isdigit() and len(rrn) == 12:
+        log.info("12-digit RRN %s suggests UPI transaction", rrn)
+        return True
+
+    return False
+
+
+def _upi_bene_if_required(s: Session, p: ComplaintProcessing, inc: Incident,
+                           account: str) -> None:
+    """Call UPI bene lookup for an IB Debit >24h that was identified as UPI.
+    Idempotent — skipped if already done for this incident."""
+    idem = f"UPI:{p.acknowledgement_no}:{inc.merchant_id}"
+    if _step_get(s, p, "UPI_BENE", idem):
+        log.info("[%s] UPI bene already fetched for RRN=%s (skip)",
+                 p.acknowledgement_no, inc.merchant_id)
+        return
+
+    log.info("[%s] IB Debit >24h: calling UPI API for RRN=%s",
+             p.acknowledgement_no, inc.merchant_id)
+    ts = f"{inc.transaction_date} {inc.transaction_time}"
+    try:
+        resp = gateway().upi_bene_lookup(
+            rrn=inc.merchant_id, account_number=account,
+            amount=str(inc.amount), transaction_timestamp=ts,
+        )
+        _step_record(s, p, "UPI_BENE", idem, {"rrn": inc.merchant_id}, resp)
+        log.info("[%s] UPI bene fetched for RRN=%s", p.acknowledgement_no, inc.merchant_id)
+    except GatewayError as e:
+        # UPI API is "if required" — log but don't fail the whole complaint
+        log.warning("[%s] UPI bene lookup failed for RRN=%s (non-fatal): %s",
+                    p.acknowledgement_no, inc.merchant_id, e)
+        _step_record(s, p, "UPI_BENE", idem,
+                     {"rrn": inc.merchant_id},
+                     {"error": str(e)}, status="FAILURE")
 
 
 def _txn_enquiry(s: Session, p: ComplaintProcessing, account: str, from_date: str) -> dict:
@@ -590,11 +666,13 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
     disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
     for row in rows[start:]:
         amt = _row_amount(row)
-        if amt <= 0:                      # skip non-debits / zero rows
+        if amt <= 0:
             continue
-        collected.append(_to_mha_txn(row, root, disputed))
+        rrn = str(row.get(config.BQ_FIELD_REF, "")).strip()
+        bene = _upi_bene_for(s, p, rrn)           # populated if UPI bene was fetched
+        collected.append(_to_mha_txn(row, root, disputed, bene=bene))
         recovered += amt
-        if recovered >= remaining:        # reconciled — include this last one and stop
+        if recovered >= remaining:
             break
 
     fully = recovered >= remaining
@@ -692,17 +770,52 @@ def _root_ctx(s: Session, p: ComplaintProcessing) -> dict:
 # Fields we don't yet have a source for are emitted as "" so the JSON shape is
 # complete. Wire them up once you confirm where they come from (transaction
 # enquiry narratives, a customer-info service, or extra CBDOC columns).
-def _to_mha_txn(row: dict, root: dict, disputed: Decimal) -> dict:
-    """A CBDOC debit leg -> MHA 'Money Transfer To' object (txn_type_id 3)."""
+def _normalise_bene(data: dict) -> dict:
+    """Map the real UPI API response (data.*) to a canonical bene dict.
+    Real UPI response keys:
+      pyAccNo     -> beneficiary account
+      pyIfscCode  -> beneficiary IFSC
+      bankName    -> beneficiary bank (short name)
+      bankCode    -> beneficiary bank code
+      pyFname     -> beneficiary name
+      pyFvaddr    -> beneficiary VPA
+    """
+    data = data or {}
+    return {
+        "account": data.get("pyAccNo", ""),
+        "ifsc":    data.get("pyIfscCode", ""),
+        "bank":    data.get("bankName", ""),
+        "bankCode": data.get("bankCode", ""),
+        "name":    data.get("pyFname", ""),
+        "vpa":     data.get("pyFvaddr", ""),
+    }
+
+
+def _upi_bene_for(s: Session, p: ComplaintProcessing, rrn: str) -> dict:
+    """Return normalised UPI bene data for this RRN if it was fetched, else {}."""
+    step = _step_get(s, p, "UPI_BENE", f"UPI:{p.acknowledgement_no}:{rrn}")
+    if step and step.status == "SUCCESS" and step.response_payload:
+        return _normalise_bene(_dig(step.response_payload, "data") or {})
+    return {}
+
+
+def _to_mha_txn(row: dict, root: dict, disputed: Decimal,
+                bene: Optional[dict] = None) -> dict:
+    """A CBDOC debit leg → MHA 'Money Transfer To' object (txn_type_id 3).
+    If UPI bene details were fetched (IB Debit >24h UPI path), they fill in
+    payee_bank / payee_account_number / ifsc_code."""
+    bene = bene or {}
     return {
         "rrn_transaction_id": row.get(config.BQ_FIELD_REF, ""),
-        "payee_bank": row.get("OGBEA1", ""),            # best-effort from bene name/addr
-        "payee_bank_code": "",
-        "payee_account_number": row.get(config.BQ_FIELD_BENE_ACCOUNT, ""),
+        "payee_bank": bene.get("bank") or row.get("OGBEA1", ""),
+        "payee_bank_code": bene.get("bankCode", ""),
+        "payee_account_number": bene.get("account") or row.get(config.BQ_FIELD_BENE_ACCOUNT, ""),
+        "payee_name": bene.get("name", ""),
+        "payee_vpa": bene.get("vpa", ""),
         "amount": str(row.get(config.BQ_FIELD_AMOUNT, "")),
         "transaction_datetime": _fmt_dt(row.get(config.BQ_FIELD_DATE), row.get(config.BQ_FIELD_TIME)) or "",
         "disputed_amount": str(disputed),
-        "ifsc_code": "",
+        "ifsc_code": bene.get("ifsc", ""),
         "txn_type": "Money Transfer To",
         "txn_type_id": "3",
         "phone_number": "",
@@ -788,13 +901,15 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
     txns = []
     for inc in incidents:
         step = _step_get(s, p, "UPI_BENE", f"UPI:{p.acknowledgement_no}:{inc.merchant_id}")
-        bene = _dig(step.response_payload, "data") if step and step.response_payload else {}
-        bene = bene or {}
+        raw = _dig(step.response_payload, "data") if step and step.response_payload else {}
+        bene = _normalise_bene(raw or {})
         txns.append({
             "rrn_transaction_id": inc.merchant_id,
-            "payee_bank": bene.get("bankName", ""),
-            "payee_bank_code": "",
-            "payee_account_number": bene.get("beneficiaryAccount", ""),
+            "payee_bank": bene.get("bank", ""),
+            "payee_bank_code": bene.get("bankCode", ""),
+            "payee_account_number": bene.get("account", ""),
+            "payee_name": bene.get("name", ""),
+            "payee_vpa": bene.get("vpa", ""),
             "amount": str(inc.amount),
             "transaction_datetime": f"{inc.transaction_date} {inc.transaction_time}",
             "disputed_amount": str(inc.disputed_amount),
