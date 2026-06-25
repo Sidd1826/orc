@@ -34,7 +34,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import config
-from classifier import CHANNEL_UPI, DIR_DEBIT, classify
+from classifier import CHANNEL_UPI, DIR_CREDIT, DIR_DEBIT, classify
 from db import session_scope
 from gateway_client import GatewayClient, GatewayError
 from logger import get_logger
@@ -281,6 +281,16 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
                 p.lease_expires_at = None
                 s.add(p); s.commit()
                 break
+            # CREDIT: RRN must have validated in the DD enquiry. If not, return a
+            # 'miscellaneous' response to MHA and stop — no balance, no hold.
+            if cls.direction == DIR_CREDIT and not _rrn_validated(s, p, incidents):
+                _finalize_miscellaneous(s, p, incidents,
+                                        "RRN not found in DD transaction enquiry")
+                p.processing_state = ST_NEEDS_REVIEW
+                p.last_error = "RRN not validated in DD enquiry (miscellaneous)"
+                p.lease_expires_at = None
+                s.add(p); s.commit()
+                break
             p.processing_state = ST_BALANCE_CHECKED
 
         elif st == ST_BALANCE_CHECKED:
@@ -370,15 +380,17 @@ def _unstash(s: Session, p: ComplaintProcessing, name: str) -> dict:
 
 def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
             incidents: list[Incident]) -> None:
-    """Fetch beneficiary / transaction context: UPI bene, live transaction
-    enquiry (< 24h), or CBDOC/BigQuery (> 24h).
+    """Fetch beneficiary / transaction context.
 
-    Scenarios table:
-      UPI Debit any age      → UPI API only (no hold)
-      IB/UPI Credit < 24h    → DD transaction enquiry → balance → hold
-      IB/UPI Credit > 24h    → CBDOC locate → balance → hold
-      IB Debit < 24h         → DD transaction enquiry → balance → hold
-      IB Debit > 24h         → CBDOC locate → UPI API if txn is UPI → balance → hold
+    Scenarios:
+      UPI Debit any age   → UPI API only (no hold)
+      CREDIT (any age)    → DD transaction enquiry FIRST to validate the RRN.
+                            If RRN not found in any narrative → caller stops and
+                            returns a 'miscellaneous' response to MHA (no hold).
+                            If found: balance → hold; and if >24h + partial, the
+                            reconcile step traces CBDOC debits after the fraud time.
+      IB Debit <24h       → DD transaction enquiry → balance → hold
+      IB Debit >24h       → CBDOC locate → UPI API if txn is UPI → balance → hold
     """
     account = instrument.payer_account_number
 
@@ -396,6 +408,25 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
             _step_record(s, p, "UPI_BENE", idem, {"rrn": inc.merchant_id}, resp)
         return
 
+    # --- CREDIT (any age): validate RRN in the live DD transaction enquiry FIRST ---
+    if cls.direction == DIR_CREDIT:
+        from_date = min(i.transaction_date for i in incidents).isoformat()
+        resp = _txn_enquiry(s, p, account, from_date)
+        details = _dig(resp, config.TXN_DETAILS_PATH) or []
+        for inc in incidents:
+            idem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
+            if _step_get(s, p, "DD_TXN", idem):
+                continue
+            matched = _find_txn_by_rrn(details, inc.merchant_id)
+            _step_record(s, p, "DD_TXN", idem,
+                         {"rrn": inc.merchant_id},
+                         {"found": matched is not None, "matched": matched or {}})
+            if matched is None:
+                log.warning("[%s] RRN=%s not found in DD enquiry narratives",
+                            p.acknowledgement_no, inc.merchant_id)
+        return
+
+    # --- IB Debit ---
     if cls.is_recent:
         # < 24h: live DD transaction enquiry, match fraud txn by RRN in narratives
         from_date = min(i.transaction_date for i in incidents).isoformat()
@@ -416,11 +447,6 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
         # > 24h: CBDOC/BigQuery archive
         for inc in incidents:
             bq_resp = _bq_locate(s, p, account, inc)
-
-            # --- IB Debit > 24h: additionally call UPI API if required ---
-            # "If required" = the CBDOC row indicates this was a UPI transaction.
-            # Detected by checking narratives for "UPI" or a UPI VPA format.
-            # Only fires for DEBIT direction (Credit path doesn't need bene lookup).
             if cls.direction == DIR_DEBIT:
                 rows = _rows(bq_resp)
                 bq_row = rows[0] if rows else {}
@@ -516,6 +542,42 @@ def _find_txn_by_rrn(details: list[dict], rrn: str) -> Optional[dict]:
             if nv == rrn or rrn in [t.strip() for t in nv.split("/")]:
                 return txn
     return None
+
+
+def _rrn_validated(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> bool:
+    """True only if EVERY incident's RRN was found in the DD enquiry. Used to
+    decide whether a credit case may proceed to hold, or must be returned to MHA
+    as 'miscellaneous'."""
+    for inc in incidents:
+        step = _step_get(s, p, "DD_TXN", f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}")
+        if not (step and (step.response_payload or {}).get("found")):
+            return False
+    return True
+
+
+def _finalize_miscellaneous(s: Session, p: ComplaintProcessing,
+                            incidents: list[Incident], reason: str) -> None:
+    """RRN didn't validate in DD enquiry → send a 'miscellaneous' response to MHA,
+    no hold, one object per incident."""
+    root = _root_ctx(s, p)
+    txns = [{
+        "rrn_transaction_id": inc.merchant_id,
+        "amount": str(inc.amount),
+        "disputed_amount": str(inc.disputed_amount),
+        "transaction_datetime": f"{inc.transaction_date} {inc.transaction_time}",
+        "txn_type": "Miscellaneous",
+        "txn_type_id": "0",
+        "status_code": "01",            # non-success: RRN not validated
+        "remarks": reason,
+        "root_account_number": root["root_account_number"],
+        "root_rrn_transaction_id": root["root_rrn_transaction_id"],
+        "root_bankid": root["root_bankid"],
+    } for inc in incidents]
+    _write_response_log(s, p, {
+        "acknowledgement_no": p.acknowledgement_no,
+        "job_id": p.job_id,
+        "transactions": txns,
+    }, response_code="01", response_message="FAILURE")
 
 
 def _dd_enquiry(s: Session, p: ComplaintProcessing, account: str) -> dict:
@@ -645,39 +707,42 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
         # be mapped correctly. Reconciliation will report 0 until that's set.
         _cbdoc_probe(s, p, incidents)
 
-    # 2. Identify the fraud transactions by reference number (the incident RRNs),
-    #    to anchor the starting point of the walk.
+    # 2. Determine the fraud transaction time from the MHA request (earliest
+    #    incident). We collect debits that occurred AFTER this moment.
+    fraud_dt_key = min(
+        (_incident_dt_key(inc) for inc in incidents),
+        default=(0, 0),
+    )
     fraud_refs = {inc.merchant_id for inc in incidents}
 
     # 3. Sort chronologically (capture date + time ascending).
     rows = sorted(rows, key=_row_dt_key)
 
-    # 4. Start collecting from the FIRST row that matches a fraud ref (the fraud
-    #    transaction). If none matches, start from the beginning (collect all).
-    start = 0
-    for i, row in enumerate(rows):
-        if str(row.get(config.BQ_FIELD_REF, "")).strip() in fraud_refs:
-            start = i
-            break
-
+    # 4. Collect debits AFTER the fraud time (per MHA's reported fraud time),
+    #    accumulating until the outstanding `remaining` is reconciled.
     collected: list[dict] = []
     recovered = Decimal("0")
     root = _root_ctx(s, p)
     disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
-    for row in rows[start:]:
+    for row in rows:
+        # only debits strictly after the fraud transaction time
+        if _row_dt_key(row) <= fraud_dt_key:
+            continue
         amt = _row_amount(row)
         if amt <= 0:
             continue
         rrn = str(row.get(config.BQ_FIELD_REF, "")).strip()
-        bene = _upi_bene_for(s, p, rrn)           # populated if UPI bene was fetched
+        if rrn in fraud_refs:            # skip the fraud txn itself
+            continue
+        bene = _upi_bene_for(s, p, rrn)  # populated if UPI bene was fetched
         collected.append(_to_mha_txn(row, root, disputed, bene=bene))
         recovered += amt
         if recovered >= remaining:
             break
 
     fully = recovered >= remaining
-    log.info("[%s] CBDOC reconcile: account debits=%d collected=%d recovered=%s "
-             "remaining=%s reconciled=%s",
+    log.info("[%s] CBDOC reconcile: account debits=%d after-fraud-collected=%d "
+             "recovered=%s remaining=%s reconciled=%s",
              p.acknowledgement_no, len(rows), len(collected), recovered, remaining, fully)
     return collected, fully
 
@@ -750,6 +815,16 @@ def _row_dt_key(row: dict) -> tuple[int, int]:
         except Exception:
             return 0
     return (_int(row.get(config.BQ_FIELD_DATE)), _int(row.get(config.BQ_FIELD_TIME)))
+
+
+def _incident_dt_key(inc: Incident) -> tuple[int, int]:
+    """Fraud time from the MHA request encoded the same way as _row_dt_key:
+    (YYYYMMDD, HHMMSS). Used to collect only CBDOC debits AFTER the fraud time."""
+    d = inc.transaction_date
+    t = inc.transaction_time
+    date_i = d.year * 10000 + d.month * 100 + d.day if d else 0
+    time_i = (t.hour * 10000 + t.minute * 100 + t.second) if t else 0
+    return (date_i, time_i)
 
 
 def _root_ctx(s: Session, p: ComplaintProcessing) -> dict:
@@ -934,17 +1009,21 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
     })
 
 
-def _write_response_log(s: Session, p: ComplaintProcessing, payload: dict) -> None:
+def _write_response_log(s: Session, p: ComplaintProcessing, payload: dict,
+                        response_code: str = "00",
+                        response_message: str = "SUCCESS") -> None:
     existing = s.execute(
         select(ApiResponseLog).where(ApiResponseLog.job_id == p.job_id)
     ).scalar_one_or_none()
     if existing:
         existing.response_payload = payload
+        existing.response_code = response_code
+        existing.response_message = response_message
         existing.responded_at = _now()
     else:
         s.add(ApiResponseLog(
             complaint_id=p.complaint_id, acknowledgement_no=p.acknowledgement_no,
-            job_id=p.job_id, response_code="00", response_message="SUCCESS",
+            job_id=p.job_id, response_code=response_code, response_message=response_message,
             response_payload=payload, responded_at=_now(),
         ))
     s.flush()
