@@ -24,6 +24,7 @@ processing_steps, so a retry never double-holds a customer's funds.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -413,6 +414,17 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
         from_date = min(i.transaction_date for i in incidents).isoformat()
         resp = _txn_enquiry(s, p, account, from_date)
         details = _dig(resp, config.TXN_DETAILS_PATH) or []
+        if not details:
+            # Path yielded nothing — either the real API nests the txn list
+            # elsewhere, or the date filter returned no rows. Self-heal: deep-find
+            # the list, and log the real shape so the path can be corrected.
+            details = _deep_find_txn_list(resp)
+            log.warning("[%s] DD enquiry: 0 txns at TXN_DETAILS_PATH='%s'. "
+                        "deep-find got %d. response keys=%s",
+                        p.acknowledgement_no, config.TXN_DETAILS_PATH,
+                        len(details), _shape(resp))
+        log.info("[%s] DD enquiry returned %d transactions (fromDate=%s)",
+                 p.acknowledgement_no, len(details), from_date)
         for inc in incidents:
             idem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
             if _step_get(s, p, "DD_TXN", idem):
@@ -424,6 +436,7 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
             if matched is None:
                 log.warning("[%s] RRN=%s not found in DD enquiry narratives",
                             p.acknowledgement_no, inc.merchant_id)
+                _log_rrn_miss(p, details, inc.merchant_id)
         return
 
     # --- IB Debit ---
@@ -432,6 +445,12 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
         from_date = min(i.transaction_date for i in incidents).isoformat()
         resp = _txn_enquiry(s, p, account, from_date)
         details = _dig(resp, config.TXN_DETAILS_PATH) or []
+        if not details:
+            details = _deep_find_txn_list(resp)
+            log.warning("[%s] DD enquiry: 0 txns at TXN_DETAILS_PATH='%s'. "
+                        "deep-find got %d. response keys=%s",
+                        p.acknowledgement_no, config.TXN_DETAILS_PATH,
+                        len(details), _shape(resp))
         for inc in incidents:
             idem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
             if _step_get(s, p, "DD_TXN", idem):
@@ -443,6 +462,7 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
             if matched is None:
                 log.warning("[%s] no transaction matched RRN=%s in enquiry",
                             p.acknowledgement_no, inc.merchant_id)
+                _log_rrn_miss(p, details, inc.merchant_id)
     else:
         # > 24h: CBDOC/BigQuery archive
         for inc in incidents:
@@ -523,25 +543,132 @@ def _txn_enquiry(s: Session, p: ComplaintProcessing, account: str, from_date: st
 
 
 def _narratives(txn: dict) -> list[str]:
-    out = []
-    for d in (txn.get("transactionDescription") or []):
-        nv = d.get("transactionNarrative") if isinstance(d, dict) else None
-        if isinstance(nv, str) and nv.strip():
-            out.append(nv.strip())
-    return out
+    """Collect every narrative string from a transaction, robust to shape.
+
+    Handles all of:
+      transactionDescription: [{transactionNarrative: "..."}, ...]
+      transactionDescription: ["...", "..."]            (plain strings)
+      transactionNarrative:    "..."  or  ["...", ...]   (directly on txn)
+      any nested dict/list containing 'narrative' keys
+    """
+    out: list[str] = []
+
+    def _add(v):
+        if isinstance(v, str) and v.strip():
+            out.append(v.strip())
+
+    def _walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if "narrative" in k.lower():
+                    if isinstance(v, str):
+                        _add(v)
+                    elif isinstance(v, list):
+                        for item in v:
+                            _add(item) if isinstance(item, str) else _walk(item)
+                    else:
+                        _walk(v)
+                elif isinstance(v, (dict, list)):
+                    _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    # Primary, known shape first (keeps order predictable)
+    desc = txn.get("transactionDescription")
+    if isinstance(desc, list):
+        for d in desc:
+            if isinstance(d, dict):
+                _add(d.get("transactionNarrative"))
+            elif isinstance(d, str):
+                _add(d)
+
+    # Then sweep the whole txn for anything missed / differently nested
+    _walk(txn)
+
+    # de-dup, preserve order
+    seen = set()
+    uniq = []
+    for n in out:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+
+def _norm_ref(s: str) -> str:
+    """Normalise a reference for comparison: drop all whitespace, uppercase."""
+    return re.sub(r"\s+", "", str(s or "")).upper()
+
+
+def _deep_find_txn_list(resp: Any) -> list[dict]:
+    """Find the transaction-details list anywhere in the response, regardless of
+    the exact path. A match = a list of dicts where the dicts contain
+    'transactionDescription' (or 'transactionNarrative' nested). Lets us recover
+    when TXN_DETAILS_PATH doesn't match the real API shape."""
+    found: list[dict] = []
+
+    def _looks_like_txn(d: dict) -> bool:
+        if not isinstance(d, dict):
+            return False
+        if "transactionDescription" in d:
+            return True
+        # some variants put narratives directly on the txn
+        return any(k.lower().startswith("transactionnarr") for k in d.keys())
+
+    def _walk(node: Any) -> None:
+        nonlocal found
+        if found:
+            return
+        if isinstance(node, list):
+            if node and all(isinstance(x, dict) for x in node) and any(_looks_like_txn(x) for x in node):
+                found = [x for x in node if isinstance(x, dict)]
+                return
+            for x in node:
+                _walk(x)
+        elif isinstance(node, dict):
+            for v in node.values():
+                _walk(v)
+
+    _walk(resp)
+    return found
 
 
 def _find_txn_by_rrn(details: list[dict], rrn: str) -> Optional[dict]:
-    """Iterate every transaction's narratives; match the one whose narrative is
-    (or contains as a '/'-separated token) the RRN."""
-    rrn = (rrn or "").strip()
-    if not rrn:
+    """Find the transaction whose narratives reference this RRN.
+
+    Matching is tolerant: case-insensitive, whitespace-stripped, and matches if
+    the RRN equals a narrative, appears as a delimited token (/, space, |, -, :,
+    comma), or is contained as a substring (for refs >= 6 chars, to avoid false
+    positives on short numbers)."""
+    target = _norm_ref(rrn)
+    if not target:
         return None
     for txn in details:
         for nv in _narratives(txn):
-            if nv == rrn or rrn in [t.strip() for t in nv.split("/")]:
+            nnv = _norm_ref(nv)
+            if not nnv:
+                continue
+            if nnv == target:
+                return txn
+            # delimited tokens
+            tokens = re.split(r"[/\s|,:\-]+", nnv)
+            if target in tokens:
+                return txn
+            # substring (only for sufficiently long refs)
+            if len(target) >= 6 and (target in nnv or nnv in target):
                 return txn
     return None
+
+
+def _log_rrn_miss(p: ComplaintProcessing, details: list[dict], rrn: str) -> None:
+    """When an RRN doesn't match, dump exactly what we searched vs every
+    narrative seen, so a real value mismatch (e.g. 0 vs 8) is visible in logs."""
+    seen = []
+    for txn in details:
+        seen.extend(_narratives(txn))
+    log.warning("[%s] RRN miss: looking for '%s' (norm='%s'); narratives seen=%s",
+                p.acknowledgement_no, rrn, _norm_ref(rrn), seen[:40])
 
 
 def _rrn_validated(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> bool:
