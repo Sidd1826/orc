@@ -24,6 +24,7 @@ processing_steps, so a retry never double-holds a customer's funds.
 """
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -282,6 +283,20 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
                 p.lease_expires_at = None
                 s.add(p); s.commit()
                 break
+            # IB Debit: DD-validated UTR -> CBDOC bene -> respond, NO hold.
+            # If the UTR wasn't validated, return 'miscellaneous' to MHA.
+            if cls.direction == DIR_DEBIT:
+                if not _rrn_validated(s, p, incidents):
+                    _finalize_miscellaneous(s, p, incidents,
+                                            "UTR not found in DD transaction enquiry")
+                    p.processing_state = ST_NEEDS_REVIEW
+                    p.last_error = "UTR not validated in DD enquiry (miscellaneous)"
+                else:
+                    _finalize_cbdoc_bene(s, p, incidents)
+                    p.processing_state = ST_RESOLVED
+                p.lease_expires_at = None
+                s.add(p); s.commit()
+                break
             # CREDIT: RRN must have validated in the DD enquiry. If not, return a
             # 'miscellaneous' response to MHA and stop — no balance, no hold.
             if cls.direction == DIR_CREDIT and not _rrn_validated(s, p, incidents):
@@ -437,11 +452,15 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
                 log.warning("[%s] RRN=%s not found in DD enquiry narratives",
                             p.acknowledgement_no, inc.merchant_id)
                 _log_rrn_miss(p, details, inc.merchant_id)
+            else:
+                log.info("[%s] RRN=%s MATCHED. transaction=%s",
+                         p.acknowledgement_no, inc.merchant_id,
+                         json.dumps(matched, default=str))
         return
 
-    # --- IB Debit ---
-    if cls.is_recent:
-        # < 24h: live DD transaction enquiry, match fraud txn by RRN in narratives
+    # --- IB Debit: validate UTR in DD enquiry, then CBDOC (by UTR) for bene.
+    #     No hold — like UPI Debit, but bene comes from CBDOC not the UPI API. ---
+    if cls.direction == DIR_DEBIT:
         from_date = min(i.transaction_date for i in incidents).isoformat()
         resp = _txn_enquiry(s, p, account, from_date)
         details = _dig(resp, config.TXN_DETAILS_PATH) or []
@@ -451,27 +470,35 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
                         "deep-find got %d. response keys=%s",
                         p.acknowledgement_no, config.TXN_DETAILS_PATH,
                         len(details), _shape(resp))
+        log.info("[%s] DD enquiry returned %d transactions (fromDate=%s)",
+                 p.acknowledgement_no, len(details), from_date)
         for inc in incidents:
-            idem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
-            if _step_get(s, p, "DD_TXN", idem):
+            ddidem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
+            if not _step_get(s, p, "DD_TXN", ddidem):
+                matched = _find_txn_by_rrn(details, inc.merchant_id)
+                _step_record(s, p, "DD_TXN", ddidem, {"rrn": inc.merchant_id},
+                             {"found": matched is not None, "matched": matched or {}})
+                if matched is None:
+                    log.warning("[%s] UTR=%s not found in DD enquiry narratives",
+                                p.acknowledgement_no, inc.merchant_id)
+                    _log_rrn_miss(p, details, inc.merchant_id)
+                    continue
+                log.info("[%s] UTR=%s MATCHED in DD enquiry", p.acknowledgement_no, inc.merchant_id)
+
+            # UTR validated -> fetch bene details from CBDOC by the UTR/RRN.
+            bqidem = f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}"
+            if _step_get(s, p, "CBDOC_BENE", bqidem):
                 continue
-            matched = _find_txn_by_rrn(details, inc.merchant_id)
-            _step_record(s, p, "DD_TXN", idem,
-                         {"rrn": inc.merchant_id},
-                         {"found": matched is not None, "matched": matched or {}})
-            if matched is None:
-                log.warning("[%s] no transaction matched RRN=%s in enquiry",
-                            p.acknowledgement_no, inc.merchant_id)
-                _log_rrn_miss(p, details, inc.merchant_id)
-    else:
-        # > 24h: CBDOC/BigQuery archive
-        for inc in incidents:
-            bq_resp = _bq_locate(s, p, account, inc)
-            if cls.direction == DIR_DEBIT:
-                rows = _rows(bq_resp)
-                bq_row = rows[0] if rows else {}
-                if _is_upi_txn(bq_row, inc):
-                    _upi_bene_if_required(s, p, inc, account)
+            bq = gateway().bigquery_search({config.BQ_FIELD_REF: inc.merchant_id}, limit=5)
+            _step_record(s, p, "CBDOC_BENE", bqidem, {config.BQ_FIELD_REF: inc.merchant_id}, bq)
+            n = len(_rows(bq))
+            log.info("[%s] CBDOC bene lookup by UTR=%s -> %d rows",
+                     p.acknowledgement_no, inc.merchant_id, n)
+        return
+
+    # --- (unreachable: directions handled above) fallback CBDOC locate ---
+    for inc in incidents:
+        _bq_locate(s, p, account, inc)
 
 
 def _is_upi_txn(bq_row: dict, inc: Incident) -> bool:
@@ -815,63 +842,88 @@ def _apply_holds(s: Session, p: ComplaintProcessing, instrument: Instrument,
 
 def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incident],
                        remaining: Decimal) -> tuple[list[dict], bool]:
-    """Account-centric CBDOC reconciliation.
+    """CBDOC reconciliation for a CREDIT fraud.
 
-    When a hold couldn't cover the disputed amount (partial hold, or no balance),
-    we go to CBDOC, anchor on the fraud transaction by its reference number, then
-    walk the account's DEBITS in chronological order from that point, collecting
-    every debit until the outstanding `remaining` amount is reconciled. ALL the
-    collected debits go back to MHA.
+    Spec:
+      1. Search CBDOC by the CREDIT RRN to locate the credit transaction.
+      2. From that credit's timestamp onward, collect every DEBIT from the
+         account in chronological order.
+      3. Keep collecting until the outstanding `remaining` amount is reconciled.
+      4. All collected debits are returned to MHA.
 
     Returns (collected_transactions, fully_reconciled)."""
     account = p.complaint.instrument.payer_account_number
 
-    # 1. Pull the account's outgoing/debit transactions from CBDOC (one query,
-    #    equality filter on the account field; client-side sort + accumulate).
+    # 1. Pull the account's CBDOC rows (one query; sort + walk client-side).
     rows = _cbdoc_account_debits(s, p, account)
     if not rows:
-        # Diagnose: log how CBDOC stores this fraud txn so the account field can
-        # be mapped correctly. Reconciliation will report 0 until that's set.
         _cbdoc_probe(s, p, incidents)
+        log.warning("[%s] CBDOC returned 0 rows for account=%s", p.acknowledgement_no, account)
+        return [], False
 
-    # 2. Determine the fraud transaction time from the MHA request (earliest
-    #    incident). We collect debits that occurred AFTER this moment.
-    fraud_dt_key = min(
-        (_incident_dt_key(inc) for inc in incidents),
-        default=(0, 0),
-    )
+    rows = sorted(rows, key=_row_dt_key)
     fraud_refs = {inc.merchant_id for inc in incidents}
 
-    # 3. Sort chronologically (capture date + time ascending).
-    rows = sorted(rows, key=_row_dt_key)
+    # 2. Anchor: find the CREDIT transaction by its RRN, capture its time.
+    anchor_key = None
+    for row in rows:
+        if str(row.get(config.BQ_FIELD_REF, "")).strip() in fraud_refs:
+            anchor_key = _row_dt_key(row)
+            log.info("[%s] CBDOC credit RRN located at date/time=%s",
+                     p.acknowledgement_no, anchor_key)
+            break
 
-    # 4. Collect debits AFTER the fraud time (per MHA's reported fraud time),
-    #    accumulating until the outstanding `remaining` is reconciled.
+    if anchor_key is None:
+        # Credit RRN not in CBDOC — fall back to the MHA-reported fraud time so we
+        # can still attempt reconciliation, but flag it.
+        anchor_key = min((_incident_dt_key(inc) for inc in incidents), default=(0, 0))
+        log.warning("[%s] credit RRN not found in CBDOC; using MHA fraud time %s as anchor",
+                    p.acknowledgement_no, anchor_key)
+
+    # 3. Collect DEBITS strictly AFTER the credit, until reconciled.
     collected: list[dict] = []
     recovered = Decimal("0")
     root = _root_ctx(s, p)
     disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
     for row in rows:
-        # only debits strictly after the fraud transaction time
-        if _row_dt_key(row) <= fraud_dt_key:
+        if _row_dt_key(row) <= anchor_key:        # only after the credit
+            continue
+        rrn = str(row.get(config.BQ_FIELD_REF, "")).strip()
+        if rrn in fraud_refs:                      # never the credit itself
+            continue
+        if not _is_debit(row):                     # debits only
             continue
         amt = _row_amount(row)
         if amt <= 0:
             continue
-        rrn = str(row.get(config.BQ_FIELD_REF, "")).strip()
-        if rrn in fraud_refs:            # skip the fraud txn itself
-            continue
-        bene = _upi_bene_for(s, p, rrn)  # populated if UPI bene was fetched
+        bene = _upi_bene_for(s, p, rrn)
         collected.append(_to_mha_txn(row, root, disputed, bene=bene))
         recovered += amt
         if recovered >= remaining:
             break
 
     fully = recovered >= remaining
-    log.info("[%s] CBDOC reconcile: account debits=%d after-fraud-collected=%d "
+    log.info("[%s] CBDOC reconcile: total rows=%d debits-after-credit collected=%d "
              "recovered=%s remaining=%s reconciled=%s",
              p.acknowledgement_no, len(rows), len(collected), recovered, remaining, fully)
     return collected, fully
+
+
+def _is_debit(row: dict) -> bool:
+    """A CBDOC row is a debit (money leaving the account).
+    The OG* table is outgoing payments, so every row is a debit by default.
+    If your CBDOC has an explicit debit/credit indicator or signed amount,
+    set BQ_DEBIT_INDICATOR_FIELD / BQ_DEBIT_INDICATOR_VALUE in config to filter."""
+    field = config.BQ_DEBIT_INDICATOR_FIELD
+    if not field:
+        # No indicator configured: signed-amount heuristic, else treat as debit.
+        raw = row.get(config.BQ_FIELD_AMOUNT)
+        try:
+            # if amounts are signed, negative = debit
+            return Decimal(str(raw)) != 0
+        except Exception:
+            return True
+    return str(row.get(field, "")).strip().upper() == config.BQ_DEBIT_INDICATOR_VALUE.upper()
 
 
 def _cbdoc_account_debits(s: Session, p: ComplaintProcessing, account: str) -> list[dict]:
@@ -1093,6 +1145,47 @@ def _finalize(s: Session, p: ComplaintProcessing, instrument: Instrument,
         "transactions": _hold_txns(s, p, root) + traced_txns,
     }
     _write_response_log(s, p, payload)
+
+
+def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> None:
+    """IB Debit: bene details come from the CBDOC row matched by the UTR/RRN.
+    One 'Money Transfer To' object per incident. No hold."""
+    root = _root_ctx(s, p)
+    txns = []
+    for inc in incidents:
+        step = _step_get(s, p, "CBDOC_BENE", f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}")
+        rows = _rows(step.response_payload) if step and step.response_payload else []
+        row = rows[0] if rows else {}
+        txns.append({
+            "rrn_transaction_id": inc.merchant_id,
+            "payee_bank": row.get("OGBEA1", ""),
+            "payee_bank_code": "",
+            "payee_account_number": row.get(config.BQ_FIELD_BENE_ACCOUNT, ""),
+            "payee_name": row.get("OGBEA1", ""),
+            "amount": str(inc.amount),
+            "transaction_datetime": _fmt_dt(row.get(config.BQ_FIELD_DATE),
+                                            row.get(config.BQ_FIELD_TIME))
+                                    or f"{inc.transaction_date} {inc.transaction_time}",
+            "disputed_amount": str(inc.disputed_amount),
+            "ifsc_code": "",
+            "txn_type": "Money Transfer To",
+            "txn_type_id": "3",
+            "phone_number": "",
+            "email": "",
+            "pan_number": "",
+            "root_account_number": root["root_account_number"],
+            "root_rrn_transaction_id": root["root_rrn_transaction_id"],
+            "root_bankid": root["root_bankid"],
+            "status_code": "00",
+            "remarks": row.get("OGNAR1", "") or "",
+            "root_effective_balance": root["root_effective_balance"],
+            "root_ifsc_code": root["root_ifsc_code"],
+        })
+    _write_response_log(s, p, {
+        "acknowledgement_no": p.acknowledgement_no,
+        "job_id": p.job_id,
+        "transactions": txns,
+    })
 
 
 def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> None:
