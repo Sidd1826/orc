@@ -827,6 +827,7 @@ def _apply_holds(s: Session, p: ComplaintProcessing, instrument: Instrument,
         account_number=account, currency=currency, amount=amount_str,
         hold_type=config.HOLD_TYPE, hold_till=config.HOLD_TILL_DATE,
         hold_narrative2=f"FRAUD {p.acknowledgement_no}"[:35],
+        hold_narrative1=f"AckNo.-{p.acknowledgement_no}-MHA",
     )
     step.status = "SUCCESS"
     step.response_payload = resp
@@ -854,31 +855,32 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
     Returns (collected_transactions, fully_reconciled)."""
     account = p.complaint.instrument.payer_account_number
 
-    rows = _cbdoc_account_debits(s, p, account)
+    rows = _cbdoc_account_debits(s, p, account, incidents)
     if not rows:
         _cbdoc_probe(s, p, incidents)
         log.warning("[%s] CBDOC returned 0 rows for account=%s", p.acknowledgement_no, account)
         return [], False
 
-    rows = sorted(rows, key=_row_dt_key)
+    rows = sorted(rows, key=_row_dt)
     fraud_refs = {inc.merchant_id for inc in incidents}
 
-    # Anchor = fraud transaction time from the MHA request (earliest incident).
-    anchor_key = min((_incident_dt_key(inc) for inc in incidents), default=(0, 0))
-    log.info("[%s] CBDOC reconcile anchored on MHA fraud time=%s",
-             p.acknowledgement_no, anchor_key)
+    # Anchor = fraud transaction time from the MHA request (earliest incident),
+    # compared against each CBDOC row's OGTMZ1 timestamp (both IST).
+    anchor = min((_incident_dt(inc) for inc in incidents), default=datetime.min)
+    log.info("[%s] CBDOC reconcile anchored on MHA fraud time=%s (matching OGTMZ1)",
+             p.acknowledgement_no, anchor.isoformat())
 
     collected: list[dict] = []
     recovered = Decimal("0")
     root = _root_ctx(s, p)
     disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
     for row in rows:
-        if _row_dt_key(row) <= anchor_key:        # only AFTER the fraud time
+        if _row_dt(row) <= anchor:                 # only txns AFTER the fraud time
             continue
         rrn = str(row.get(config.BQ_FIELD_REF, "")).strip()
-        if rrn in fraud_refs:                      # never the fraud txn itself
+        if rrn in fraud_refs:                       # never the fraud txn itself
             continue
-        if not _is_debit(row):                     # debits only
+        if not _is_debit(row):                      # debits only
             continue
         amt = _row_amount(row)
         if amt <= 0:
@@ -890,7 +892,7 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
             break
 
     fully = recovered >= remaining
-    log.info("[%s] CBDOC reconcile: total rows=%d debits-after-fraud collected=%d "
+    log.info("[%s] CBDOC reconcile: total rows=%d after-fraud collected=%d "
              "recovered=%s remaining=%s reconciled=%s",
              p.acknowledgement_no, len(rows), len(collected), recovered, remaining, fully)
     return collected, fully
@@ -913,18 +915,29 @@ def _is_debit(row: dict) -> bool:
     return str(row.get(field, "")).strip().upper() == config.BQ_DEBIT_INDICATOR_VALUE.upper()
 
 
-def _cbdoc_account_debits(s: Session, p: ComplaintProcessing, account: str) -> list[dict]:
-    """Fetch the account's debit transactions from CBDOC (cached per complaint).
-    Filters on BQ_FIELD_ACCOUNT — set that env var to the CBDOC column that holds
-    the DEBITED (originating) account. On 0 rows, runs a diagnostic probe."""
+def _cbdoc_account_debits(s: Session, p: ComplaintProcessing, account: str,
+                          incidents: Optional[list[Incident]] = None) -> list[dict]:
+    """Fetch the account's transactions from CBDOC (cached per complaint).
+
+    Per spec: search by account (BQ_FIELD_ACCOUNT) and optionally the fraud date
+    (BQ_FIELD_DATE) so the query returns that day's transactions; the caller then
+    filters to those AFTER the fraud time and accumulates debits until reconciled.
+
+    IMPORTANT: BQ_FIELD_ACCOUNT must be the CBDOC column holding the account whose
+    outgoing debits you want. If the account search returns 0, a probe logs the
+    fraud row's fields so the right column can be identified."""
     idem = f"CBDOCDEBITS:{p.acknowledgement_no}:{account}"
     existing = _step_get(s, p, "BQ_TRACE", idem)
     if existing and existing.status == "SUCCESS":
         return _rows(existing.response_payload or {})
 
-    filt = {config.BQ_FIELD_ACCOUNT: account}
-    log.info("[%s] CBDOC account search: field BQ_FIELD_ACCOUNT=%s value=%s",
-             p.acknowledgement_no, config.BQ_FIELD_ACCOUNT, account)
+    filt: dict[str, Any] = {config.BQ_FIELD_ACCOUNT: config.BQ_ACCOUNT_PREFIX + _strip_acct(account)}
+    # Optionally narrow by fraud date (YYYYMMDD) when enabled.
+    if config.CBDOC_FILTER_BY_DATE and incidents:
+        d = min(i.transaction_date for i in incidents)
+        filt[config.BQ_FIELD_DATE] = d.year * 10000 + d.month * 100 + d.day
+
+    log.info("[%s] CBDOC account search filter=%s", p.acknowledgement_no, filt)
     resp = gateway().bigquery_search(filt, limit=config.CBDOC_MAX_ROWS)
     rows = _rows(resp)
     _step_record(s, p, "BQ_TRACE", idem, filt, resp)
@@ -973,24 +986,62 @@ def _row_amount(row: dict) -> Decimal:
         return Decimal("0")
 
 
-def _row_dt_key(row: dict) -> tuple[int, int]:
-    """Sort key: capture date then capture time (ints), 0 if missing."""
-    def _int(v):
+def _parse_ogtmz1(v: Any) -> Optional[datetime]:
+    """Parse CBDOC OGTMZ1 'YYYY-MM-DD-HH.MM.SS.ffffff' (IST) into a datetime.
+    Tolerates missing microseconds. Returns None if unparseable."""
+    if not v:
+        return None
+    s = str(v).strip()
+    for fmt in ("%Y-%m-%d-%H.%M.%S.%f", "%Y-%m-%d-%H.%M.%S"):
         try:
-            return int(v)
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _row_dt(row: dict) -> datetime:
+    """Real transaction time of a CBDOC row. Prefers OGTMZ1; falls back to
+    OGCPDT (YYYYMMDD) + OGCPTM (HHMMSS). datetime.min if nothing usable."""
+    ts = _parse_ogtmz1(row.get(config.BQ_FIELD_TIMESTAMP))
+    if ts is not None:
+        return ts
+    def _int(x):
+        try:
+            return int(x)
         except Exception:
             return 0
-    return (_int(row.get(config.BQ_FIELD_DATE)), _int(row.get(config.BQ_FIELD_TIME)))
+    d, t = _int(row.get(config.BQ_FIELD_DATE)), _int(row.get(config.BQ_FIELD_TIME))
+    if not d:
+        return datetime.min
+    ts6 = str(t).zfill(6)
+    try:
+        return datetime(d // 10000, (d // 100) % 100, d % 100,
+                        int(ts6[0:2]), int(ts6[2:4]), int(ts6[4:6]))
+    except Exception:
+        return datetime.min
 
 
-def _incident_dt_key(inc: Incident) -> tuple[int, int]:
-    """Fraud time from the MHA request encoded the same way as _row_dt_key:
-    (YYYYMMDD, HHMMSS). Used to collect only CBDOC debits AFTER the fraud time."""
-    d = inc.transaction_date
-    t = inc.transaction_time
-    date_i = d.year * 10000 + d.month * 100 + d.day if d else 0
-    time_i = (t.hour * 10000 + t.minute * 100 + t.second) if t else 0
-    return (date_i, time_i)
+def _incident_dt(inc: Incident) -> datetime:
+    """Fraud time from the MHA request as a datetime (IST; no conversion needed,
+    OGTMZ1 is already IST). Used to collect only CBDOC txns AFTER the fraud time."""
+    d, t = inc.transaction_date, inc.transaction_time
+    if not d:
+        return datetime.min
+    return datetime(d.year, d.month, d.day,
+                    t.hour if t else 0, t.minute if t else 0, t.second if t else 0)
+
+
+def _strip_acct(v: Any) -> str:
+    """Strip the leading '/' CBDOC stores on account values."""
+    s = str(v or "").strip()
+    return s[1:] if s.startswith("/") else s
+
+
+def _fmt_row_dt(row: dict) -> str:
+    """Format a CBDOC row's real transaction time for the MHA response."""
+    dt = _row_dt(row)
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt != datetime.min else ""
 
 
 def _root_ctx(s: Session, p: ComplaintProcessing) -> dict:
@@ -1050,11 +1101,11 @@ def _to_mha_txn(row: dict, root: dict, disputed: Decimal,
         "rrn_transaction_id": row.get(config.BQ_FIELD_REF, ""),
         "payee_bank": bene.get("bank") or row.get("OGBEA1", ""),
         "payee_bank_code": bene.get("bankCode", ""),
-        "payee_account_number": bene.get("account") or row.get(config.BQ_FIELD_BENE_ACCOUNT, ""),
+        "payee_account_number": bene.get("account") or _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
         "payee_name": bene.get("name", ""),
         "payee_vpa": bene.get("vpa", ""),
         "amount": str(row.get(config.BQ_FIELD_AMOUNT, "")),
-        "transaction_datetime": _fmt_dt(row.get(config.BQ_FIELD_DATE), row.get(config.BQ_FIELD_TIME)) or "",
+        "transaction_datetime": _fmt_row_dt(row),
         "disputed_amount": str(disputed),
         "ifsc_code": bene.get("ifsc", ""),
         "txn_type": "Money Transfer To",

@@ -63,8 +63,8 @@ MAX_TRACE_LAYERS          = _env_int("MAX_TRACE_LAYERS", 5)
 #     data.accounts[].currentBalance.amount. Dotted path supports list indices.
 #     If the path misses, the code deep-searches for BALANCE_FIELD.amount and
 #     logs the path it found, so you can set BALANCE_PATH precisely.
-BALANCE_PATH  = _env("BALANCE_PATH", "data.accounts.0.currentBalance.amount")
-BALANCE_FIELD = _env("BALANCE_FIELD", "currentBalance")   # deep-search fallback target
+BALANCE_PATH  = _env("BALANCE_PATH", "data.accounts.0.availableBalance.amount")
+BALANCE_FIELD = _env("BALANCE_FIELD", "availableBalance")   # deep-search fallback target
 
 # Whether to auto-detect UPI transactions in CBDOC rows (IB Debit >24h path)
 # and call the UPI API for bene details. Set false to disable detection entirely.
@@ -81,16 +81,19 @@ HOLD_TYPE      = _env("HOLD_TYPE", "F")            # per your sample (F)
 HOLD_TILL_DATE = _env("HOLD_TILL_DATE", "2099-12-31")
 HOLD_CURRENCY  = _env("HOLD_CURRENCY", "INR")
 
-# --- BigQuery (CBDOC) field mapping ---
-BQ_FIELD_REF          = _env("BQ_FIELD_REF", "OGTRNO")
+# --- BigQuery (CBDOC) field mapping (confirmed against a real CBDOC row) ---
+BQ_FIELD_REF          = _env("BQ_FIELD_REF", "LPUTRN")     # UTR/RRN (NOT OGTRNO)
 BQ_FIELD_AMOUNT       = _env("BQ_FIELD_AMOUNT", "OGPYAM")
 BQ_FIELD_DATE         = _env("BQ_FIELD_DATE", "OGCPDT")
 BQ_FIELD_TIME         = _env("BQ_FIELD_TIME", "OGCPTM")
-# IMPORTANT: BQ_FIELD_ACCOUNT must be the CBDOC column for the DEBITED
-# (originating) account — the one we collect debits FROM. The OG* whitelist is
-# beneficiary-centric, so confirm which column actually holds the source account
-# and set this accordingly.
+# Real transaction timestamp column, format 'YYYY-MM-DD-HH.MM.SS.ffffff' (IST).
+# Used to compare against the MHA fraud time. Falls back to OGCPDT/OGCPTM if empty.
+BQ_FIELD_TIMESTAMP    = _env("BQ_FIELD_TIMESTAMP", "OGTMZ1")
+# Account column. Values are stored with a leading '/', e.g. '/INHSBC006361141001'.
+# BQ_ACCOUNT_PREFIX is prepended to the account when filtering (the gateway does
+# exact-equality), and stripped when reading values client-side.
 BQ_FIELD_ACCOUNT      = _env("BQ_FIELD_ACCOUNT", "OGBEAC")
+BQ_ACCOUNT_PREFIX     = _env("BQ_ACCOUNT_PREFIX", "/")
 BQ_FIELD_BENE_ACCOUNT = _env("BQ_FIELD_BENE_ACCOUNT", "OGBEAC")
 CBDOC_MAX_ROWS        = _env_int("CBDOC_MAX_ROWS", 500)
 
@@ -100,3 +103,8 @@ CBDOC_MAX_ROWS        = _env_int("CBDOC_MAX_ROWS", 500)
 # field empty if the table is debit-only (OG* = outgoing payments).
 BQ_DEBIT_INDICATOR_FIELD = _env("BQ_DEBIT_INDICATOR_FIELD", "")
 BQ_DEBIT_INDICATOR_VALUE = _env("BQ_DEBIT_INDICATOR_VALUE", "D")
+
+# When true, the CBDOC account search also filters by the fraud date (BQ_FIELD_DATE)
+# so it returns that day's transactions; the caller then keeps those after the
+# fraud TIME. Set false to pull all account rows and filter purely client-side.
+CBDOC_FILTER_BY_DATE = _env("CBDOC_FILTER_BY_DATE", "false").lower() == "true"
