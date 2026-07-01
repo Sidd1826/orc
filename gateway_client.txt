@@ -13,6 +13,7 @@ X-HSBC-Sensitive-Data body, shaped [{"key": <token>, "value": <real account>}].
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any, Optional
 
 import httpx
@@ -21,6 +22,37 @@ import config
 from logger import get_logger
 
 log = get_logger(__name__)
+
+
+def _as_int(v: Any) -> Any:
+    """UPI rrn is numeric. Convert if it's a clean integer string, else pass through."""
+    try:
+        return int(str(v).strip())
+    except (ValueError, TypeError):
+        return v
+
+
+def _as_number(v: Any) -> Any:
+    """UPI amount is numeric. Use int when whole (100 not 100.0), else float."""
+    try:
+        f = float(str(v).strip())
+        return int(f) if f.is_integer() else f
+    except (ValueError, TypeError):
+        return v
+
+
+def _to_upi_date(ts: str) -> str:
+    """Convert a timestamp to UPI's 'DD-MM-YYYY HH:MM:SS' format.
+    Accepts 'YYYY-MM-DD HH:MM[:SS]' or 'YYYY-MM-DDTHH:MM[:SS]'. Falls back to
+    the input unchanged if it can't be parsed."""
+    s = (ts or "").strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%d-%m-%Y %H:%M:%S")
+        except ValueError:
+            continue
+    return ts
 
 
 class GatewayError(Exception):
@@ -101,7 +133,7 @@ class GatewayClient:
         token, sensitive = _sensitive(real_account)
         return self._request(
             "GET", "/api/v1/accounts/demand-deposit",
-            params={"hubCustomerNumber": token},
+            params={"hubCustomerNumber": token, "accountFormat": "H"},
             json_body={"sensitiveData": sensitive},
         )
 
@@ -113,10 +145,12 @@ class GatewayClient:
                             to_date: Optional[str] = None) -> dict[str, Any]:
         token, sensitive = _sensitive(real_account)
         params: dict[str, str] = {"accountNumber": token}
+        # HSBC DD transaction-history expects 'transactionStartDate' (and
+        # 'transactionEndDate'), NOT fromDate/toDate.
         if from_date:
-            params["fromDate"] = from_date
+            params["transactionStartDate"] = from_date
         if to_date:
-            params["toDate"] = to_date
+            params["transactionEndDate"] = to_date
         return self._request(
             "GET", "/api/v1/transactions/history",
             params=params, json_body={"sensitiveData": sensitive},
@@ -141,18 +175,24 @@ class GatewayClient:
         return self._request("POST", "/api/v1/accounts/apply-hold", json_body=body)
 
     # ------------------------------------------------------------------
-    # UPI beneficiary lookup (RRN + account + amount + timestamp).
+    # UPI secure call (beneficiary lookup).
+    # Real HSBC UPI contract (confirmed via working curl):
+    #   { "systemId": <int>, "payload": { "rrn": <int>, "accNo": "<str>",
+    #     "amount": <int>, "crtDate": "DD-MM-YYYY HH:MM:SS" } }
+    # The gateway AES-encrypts this whole body before sending to HSBC.
     # ------------------------------------------------------------------
     def upi_bene_lookup(self, *, rrn: str, account_number: str,
                         amount: str, transaction_timestamp: str) -> dict[str, Any]:
-        # NOTE: exact payload keys depend on the UPI contract — confirm & adjust.
-        payload = {
-            "rrn": rrn,
-            "accountNumber": account_number,
-            "amount": amount,
-            "transactionTimestamp": transaction_timestamp,
+        body = {
+            "systemId": config.UPI_SYSTEM_ID,
+            "payload": {
+                "rrn":     _as_int(rrn),
+                "accNo":   account_number,
+                "amount":  _as_number(amount),
+                "crtDate": _to_upi_date(transaction_timestamp),
+            },
         }
-        return self._request("POST", "/api/v1/upi/secure", json_body=payload)
+        return self._request("POST", "/api/v1/upi/secure", json_body=body)
 
     # ------------------------------------------------------------------
     # BigQuery (CBDOC) search.

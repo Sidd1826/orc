@@ -845,16 +845,15 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
     """CBDOC reconciliation for a CREDIT fraud.
 
     Spec:
-      1. Search CBDOC by the CREDIT RRN to locate the credit transaction.
-      2. From that credit's timestamp onward, collect every DEBIT from the
-         account in chronological order.
-      3. Keep collecting until the outstanding `remaining` amount is reconciled.
-      4. All collected debits are returned to MHA.
+      1. Hit CBDOC with the account number.
+      2. Anchor on the fraud transaction_time from the MHA request.
+      3. Collect every DEBIT logged AFTER that time, chronologically.
+      4. Keep collecting until the outstanding `remaining` is reconciled.
+      5. All collected debits are returned to MHA.
 
     Returns (collected_transactions, fully_reconciled)."""
     account = p.complaint.instrument.payer_account_number
 
-    # 1. Pull the account's CBDOC rows (one query; sort + walk client-side).
     rows = _cbdoc_account_debits(s, p, account)
     if not rows:
         _cbdoc_probe(s, p, incidents)
@@ -864,32 +863,20 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
     rows = sorted(rows, key=_row_dt_key)
     fraud_refs = {inc.merchant_id for inc in incidents}
 
-    # 2. Anchor: find the CREDIT transaction by its RRN, capture its time.
-    anchor_key = None
-    for row in rows:
-        if str(row.get(config.BQ_FIELD_REF, "")).strip() in fraud_refs:
-            anchor_key = _row_dt_key(row)
-            log.info("[%s] CBDOC credit RRN located at date/time=%s",
-                     p.acknowledgement_no, anchor_key)
-            break
+    # Anchor = fraud transaction time from the MHA request (earliest incident).
+    anchor_key = min((_incident_dt_key(inc) for inc in incidents), default=(0, 0))
+    log.info("[%s] CBDOC reconcile anchored on MHA fraud time=%s",
+             p.acknowledgement_no, anchor_key)
 
-    if anchor_key is None:
-        # Credit RRN not in CBDOC — fall back to the MHA-reported fraud time so we
-        # can still attempt reconciliation, but flag it.
-        anchor_key = min((_incident_dt_key(inc) for inc in incidents), default=(0, 0))
-        log.warning("[%s] credit RRN not found in CBDOC; using MHA fraud time %s as anchor",
-                    p.acknowledgement_no, anchor_key)
-
-    # 3. Collect DEBITS strictly AFTER the credit, until reconciled.
     collected: list[dict] = []
     recovered = Decimal("0")
     root = _root_ctx(s, p)
     disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
     for row in rows:
-        if _row_dt_key(row) <= anchor_key:        # only after the credit
+        if _row_dt_key(row) <= anchor_key:        # only AFTER the fraud time
             continue
         rrn = str(row.get(config.BQ_FIELD_REF, "")).strip()
-        if rrn in fraud_refs:                      # never the credit itself
+        if rrn in fraud_refs:                      # never the fraud txn itself
             continue
         if not _is_debit(row):                     # debits only
             continue
@@ -903,7 +890,7 @@ def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incid
             break
 
     fully = recovered >= remaining
-    log.info("[%s] CBDOC reconcile: total rows=%d debits-after-credit collected=%d "
+    log.info("[%s] CBDOC reconcile: total rows=%d debits-after-fraud collected=%d "
              "recovered=%s remaining=%s reconciled=%s",
              p.acknowledgement_no, len(rows), len(collected), recovered, remaining, fully)
     return collected, fully

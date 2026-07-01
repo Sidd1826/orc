@@ -11,14 +11,14 @@ from datetime import date, time
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class IncidentIn(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     amount: Decimal
-    merchant_id: str = Field(validation_alias=AliasChoices("m", "merchant_id"))
+    merchant_id: str = Field(validation_alias=AliasChoices("rrn", "merchant_id", "m"))
     transaction_date: date = Field(validation_alias=AliasChoices("transaction_date", "transaction date"))
     transaction_time: time = Field(validation_alias=AliasChoices("transaction_time", "transaction time"))
     disputed_amount: Decimal = Field(validation_alias=AliasChoices("disputed_amount", "disputed amount"))
@@ -36,6 +36,17 @@ class InstrumentIn(BaseModel):
         default="Unknown",
         validation_alias=AliasChoices("transaction_type", "transaction type"),
     )
+
+    @field_validator("transaction_type", mode="before")
+    @classmethod
+    def _normalise_txn_type(cls, v):
+        """MHA may send '' or odd casing. Map to the DB enum
+        ('P2P','P2M','Collect','Refund','Unknown'); blank/unknown -> 'Unknown'."""
+        if v is None or str(v).strip() == "":
+            return "Unknown"
+        allowed = {"p2p": "P2P", "p2m": "P2M", "collect": "Collect",
+                   "refund": "Refund", "unknown": "Unknown"}
+        return allowed.get(str(v).strip().lower(), "Unknown")
     wallet: Optional[str] = None
     payer_mobile_number: str = Field(validation_alias=AliasChoices("payer_mobile_number", "payer mobile number"))
     payer_account_number: str = Field(validation_alias=AliasChoices("payer_account_number", "payer account number"))
