@@ -903,11 +903,27 @@ def _fmt_txn_time(txn: dict) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S") if dt != m else ""
 
 
-def _classify_rrn(token: str, payer_digits: str) -> Optional[tuple[str, str]]:
+def _scheme_from_narratives(txn: dict) -> Optional[str]:
+    """Detect the payment scheme from a transaction's narratives (a standalone
+    tag like 'IMPS', 'UPI', 'NEFT', 'RTGS' usually sits next to the RRN).
+    Returns the scheme or None if no tag is present."""
+    for nv in _narratives(txn):
+        u = nv.strip().upper()
+        for scheme in ("IMPS", "UPI", "NEFT", "RTGS"):
+            # match as a standalone token, not a substring of the RRN
+            if u == scheme or scheme in re.split(r"[/\s,;|]+", u):
+                return scheme
+    return None
+
+
+def _classify_rrn(token: str, payer_digits: str,
+                  scheme: Optional[str] = None) -> Optional[tuple[str, str]]:
     """Classify a narrative token as an RRN. Returns (rrn, type) or None.
       HSBCN...  -> NEFT
       HSBCR...  -> RTGS
-      12 digits -> UPI   (unless it's the payer's own account number)
+      12 digits -> use the transaction's scheme tag if present (UPI vs IMPS),
+                   else UPI (the UPI-API probe later confirms/denies).
+      payer's own 12-digit account -> not an RRN.
     """
     t = (token or "").strip()
     if not t:
@@ -920,25 +936,38 @@ def _classify_rrn(token: str, payer_digits: str) -> Optional[tuple[str, str]]:
     if t.isdigit() and len(t) == 12:
         if payer_digits and t in payer_digits:      # payer's own account, not an RRN
             return None
-        return (t, "UPI")
+        if scheme in ("UPI", "IMPS"):
+            return (t, scheme)                        # scheme tag decides
+        return (t, "UPI")                             # no tag -> assume UPI, probe confirms
     return None
 
 
 def _extract_rrns(txn: dict, payer_digits: str) -> list[tuple[str, str]]:
-    """All classifiable RRNs from a txn's narratives, de-duplicated, order-preserved."""
+    """All classifiable RRNs from a txn's narratives, scheme-aware, de-duplicated."""
+    scheme = _scheme_from_narratives(txn)
     out: dict[str, str] = {}
     for nv in _narratives(txn):
         for tok in re.split(r"[/\s,;|]+", nv):
-            c = _classify_rrn(tok, payer_digits)
+            c = _classify_rrn(tok, payer_digits, scheme)
             if c and c[0] not in out:
                 out[c[0]] = c[1]
     return list(out.items())
 
 
 def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
-                  account: str, amount: Decimal, ts_iso: str) -> dict:
-    """Fetch bene details for one RRN: UPI -> UPI API; NEFT/RTGS -> CBDOC by LPUTRN.
-    Idempotent, non-fatal (returns {} on failure)."""
+                  account: str, amount: Decimal, ts_iso: str) -> tuple[dict, str, str]:
+    """Fetch bene details for one RRN. Returns (bene, final_type, status).
+
+      IMPS      -> out of scope, no lookup. status='ops_review' (ops adds bene manually).
+      UPI       -> UPI API. Valid -> status='resolved'. Invalid response means it was
+                   actually IMPS -> downgrade type to IMPS, status='ops_review'.
+      NEFT/RTGS -> CBDOC by LPUTRN. status='resolved' (empty row -> still resolved,
+                   just blank bene).
+    status is one of: 'resolved' | 'ops_review'.
+    """
+    if rtype == "IMPS":
+        return {}, "IMPS", "ops_review"
+
     if rtype == "UPI":
         idem = f"UPI:{p.acknowledgement_no}:{rrn}"
         step = _step_get(s, p, "UPI_BENE", idem)
@@ -949,11 +978,19 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
                     transaction_timestamp=ts_iso)
                 step = _step_record(s, p, "UPI_BENE", idem, {"rrn": rrn}, resp)
             except GatewayError as e:
-                log.warning("[%s] UPI bene failed rrn=%s: %s", p.acknowledgement_no, rrn, e)
-                return {}
-        return _normalise_bene(_dig(step.response_payload, "data") or {})
+                # UPI API rejected it -> not a UPI RRN -> treat as IMPS (ops).
+                log.info("[%s] UPI API invalid for rrn=%s (%s) -> IMPS/ops",
+                         p.acknowledgement_no, rrn, e)
+                _step_record(s, p, "UPI_BENE", idem, {"rrn": rrn},
+                             {"invalid": True, "error": str(e)}, status="FAILURE")
+                return {}, "IMPS", "ops_review"
+        data = _dig(step.response_payload, "data") or {}
+        if not data or (step.response_payload or {}).get("invalid"):
+            # cached invalid, or empty payload -> IMPS/ops
+            return {}, "IMPS", "ops_review"
+        return _normalise_bene(data), "UPI", "resolved"
 
-    # NEFT / RTGS -> CBDOC, filter by LPUTRN (BQ_FIELD_REF)
+    # NEFT / RTGS -> CBDOC by LPUTRN
     idem = f"CBDOCBENE:{p.acknowledgement_no}:{rrn}"
     step = _step_get(s, p, "CBDOC_BENE", idem)
     if not step:
@@ -962,23 +999,28 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
             step = _step_record(s, p, "CBDOC_BENE", idem, {config.BQ_FIELD_REF: rrn}, resp)
         except GatewayError as e:
             log.warning("[%s] CBDOC bene failed rrn=%s: %s", p.acknowledgement_no, rrn, e)
-            return {}
+            return {}, rtype, "resolved"
     rows = _rows(step.response_payload)
     row = rows[0] if rows else {}
-    return {
+    bene = {
         "account": _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
         "bank": row.get("OGBEA1", ""),
         "name": row.get("OGBEA1", ""),
         "ifsc": "", "bankCode": "", "vpa": "",
     }
+    return bene, rtype, "resolved"
 
 
 def _mha_debit_obj(rrn: str, rtype: str, amount: Decimal, txn: dict,
-                   bene: dict, root: dict, disputed: Decimal) -> dict:
-    """One MHA 'Money Transfer To' object for a traced debit RRN + its bene."""
+                   bene: dict, root: dict, disputed: Decimal,
+                   bene_status: str = "resolved") -> dict:
+    """One MHA 'Money Transfer To' object for a traced debit RRN + its bene.
+    bene_status='ops_review' flags IMPS (or unresolvable) legs for the ops team
+    to fill in the beneficiary manually."""
     return {
         "rrn_transaction_id": rrn,
-        "rrn_type": rtype,                       # NEFT / RTGS / UPI
+        "rrn_type": rtype,                       # NEFT / RTGS / UPI / IMPS
+        "bene_status": bene_status,              # 'resolved' | 'ops_review'
         "payee_bank": bene.get("bank", ""),
         "payee_bank_code": bene.get("bankCode", ""),
         "payee_account_number": bene.get("account", ""),
@@ -994,7 +1036,8 @@ def _mha_debit_obj(rrn: str, rtype: str, amount: Decimal, txn: dict,
         "root_account_number": root["root_account_number"],
         "root_rrn_transaction_id": root["root_rrn_transaction_id"],
         "root_bankid": root["root_bankid"],
-        "status_code": "00", "remarks": "",
+        "status_code": "02" if bene_status == "ops_review" else "00",
+        "remarks": "IMPS - pending manual bene lookup by ops" if bene_status == "ops_review" else "",
         "root_effective_balance": root["root_effective_balance"],
         "root_ifsc_code": root["root_ifsc_code"],
     }
@@ -1039,6 +1082,7 @@ def _reconcile_credit_from_dd(s: Session, p: ComplaintProcessing,
     debits = sorted((t for t in details if _is_debit_txn(t)), key=_txn_time)
     objs: list[dict] = []
     recovered = Decimal("0")
+    ops_pending = 0
     root = _root_ctx(s, p)
     disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
     seen: set[str] = set()
@@ -1054,17 +1098,21 @@ def _reconcile_credit_from_dd(s: Session, p: ComplaintProcessing,
             if rrn in seen:
                 continue
             seen.add(rrn)
-            bene = _bene_for_rrn(s, p, rrn, rtype, account, amt, ts_iso)
-            objs.append(_mha_debit_obj(rrn, rtype, amt, txn, bene, root, disputed))
-            log.info("[%s] traced debit rrn=%s type=%s amount=%s",
-                     p.acknowledgement_no, rrn, rtype, amt)
-        recovered += amt
+            bene, final_type, status = _bene_for_rrn(s, p, rrn, rtype, account, amt, ts_iso)
+            objs.append(_mha_debit_obj(rrn, final_type, amt, txn, bene, root, disputed,
+                                       bene_status=status))
+            if status == "ops_review":
+                ops_pending += 1
+            log.info("[%s] traced debit rrn=%s type=%s status=%s amount=%s",
+                     p.acknowledgement_no, rrn, final_type, status, amt)
+        recovered += amt                      # IMPS included: the money DID leave
         if recovered >= remaining:
             break
 
     fully = recovered >= remaining
-    log.info("[%s] DD reconcile done: objs=%d recovered=%s remaining=%s reconciled=%s",
-             p.acknowledgement_no, len(objs), recovered, remaining, fully)
+    log.info("[%s] DD reconcile done: objs=%d ops_pending=%d recovered=%s "
+             "remaining=%s reconciled=%s",
+             p.acknowledgement_no, len(objs), ops_pending, recovered, remaining, fully)
     return objs, fully
 
 
