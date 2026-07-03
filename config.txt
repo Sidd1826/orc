@@ -108,3 +108,15 @@ BQ_DEBIT_INDICATOR_VALUE = _env("BQ_DEBIT_INDICATOR_VALUE", "D")
 # so it returns that day's transactions; the caller then keeps those after the
 # fraud TIME. Set false to pull all account rows and filter purely client-side.
 CBDOC_FILTER_BY_DATE = _env("CBDOC_FILTER_BY_DATE", "false").lower() == "true"
+
+# Recent fraud (<24h) isn't in CBDOC yet (CBDOC is T+1). After a partial/no-balance
+# hold we defer reconciliation until fraud_time + CBDOC_BUFFER_HOURS (buffer past
+# the T+1 update). If CBDOC is still empty when we wake, re-defer up to
+# MAX_CBDOC_DEFERS times, then mark NEEDS_REVIEW.
+CBDOC_BUFFER_HOURS = _env_int("CBDOC_BUFFER_HOURS", 28)
+MAX_CBDOC_DEFERS   = _env_int("MAX_CBDOC_DEFERS", 3)
+
+# Credit reconciliation now sources DEBITS from the live DD transaction enquiry
+# (available immediately), so recent frauds no longer need to wait for CBDOC T+1.
+# Set true to re-enable the 28h defer for recent partial/no-balance cases.
+CBDOC_DEFER_RECENT = _env("CBDOC_DEFER_RECENT", "false").lower() == "true"

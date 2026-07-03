@@ -61,6 +61,7 @@ ST_CLASSIFIED      = "CLASSIFIED"
 ST_ENRICHED        = "ENRICHED"
 ST_BALANCE_CHECKED = "BALANCE_CHECKED"
 ST_HOLD_APPLIED    = "HOLD_APPLIED"
+ST_AWAITING_CBDOC  = "AWAITING_CBDOC"   # recent fraud: hold done, waiting for CBDOC T+1 data
 ST_RECONCILING     = "RECONCILING"
 ST_RESOLVED        = "RESOLVED"
 ST_NEEDS_REVIEW    = "NEEDS_REVIEW"
@@ -104,6 +105,8 @@ class ComplaintProcessing(Base):
     job_id: Mapped[Optional[str]] = mapped_column(String(60))
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    defer_count: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

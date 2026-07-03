@@ -15,14 +15,20 @@ CREATE TABLE IF NOT EXISTS complaint_processing (
     job_id              VARCHAR(60),
     attempt_count       INT         NOT NULL DEFAULT 0,
     lease_expires_at    TIMESTAMPTZ,
+    next_attempt_at     TIMESTAMPTZ,
+    defer_count         INT         NOT NULL DEFAULT 0,
     last_error          TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- The poller's hot query: non-terminal, lease-free rows, oldest first.
+-- Idempotent adds for already-deployed tables.
+ALTER TABLE complaint_processing ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
+ALTER TABLE complaint_processing ADD COLUMN IF NOT EXISTS defer_count INT NOT NULL DEFAULT 0;
+
+-- The poller's hot query: non-terminal, lease-free, ready (next_attempt_at) rows.
 CREATE INDEX IF NOT EXISTS idx_cp_poll
-    ON complaint_processing (processing_state, lease_expires_at, created_at);
+    ON complaint_processing (processing_state, lease_expires_at, next_attempt_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_cp_ack ON complaint_processing(acknowledgement_no);
 
 -- 2) Per-external-call audit + idempotency ------------------------------------

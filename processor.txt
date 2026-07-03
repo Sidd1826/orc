@@ -42,6 +42,7 @@ from gateway_client import GatewayClient, GatewayError
 from logger import get_logger
 from models import (
     ST_BALANCE_CHECKED, ST_CLASSIFIED, ST_ENRICHED, ST_HOLD_APPLIED,
+    ST_AWAITING_CBDOC,
     ST_NEEDS_REVIEW, ST_RECEIVED, ST_RECONCILING, ST_RESOLVED,
     TERMINAL_STATES,
     ApiResponseLog, Complaint, ComplaintProcessing, Incident, Instrument,
@@ -183,6 +184,8 @@ def claim_batch(limit: int) -> list[int]:
                 ComplaintProcessing.attempt_count < config.MAX_ATTEMPTS,
                 or_(ComplaintProcessing.lease_expires_at.is_(None),
                     ComplaintProcessing.lease_expires_at < now),
+                or_(ComplaintProcessing.next_attempt_at.is_(None),
+                    ComplaintProcessing.next_attempt_at <= now),
             )
             .order_by(ComplaintProcessing.created_at)
             .limit(limit)
@@ -317,19 +320,37 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
 
         elif st == ST_HOLD_APPLIED:
             remaining = Decimal(_unstash(s, p, "REMAINING").get("value", "0"))
-            if remaining > 0:
-                p.processing_state = ST_RECONCILING
-            else:
+            if remaining <= 0:
+                # Full hold covered the disputed amount -> respond now, done.
                 _finalize(s, p, instrument, incidents, traced_txns=[])
                 p.processing_state = ST_RESOLVED
+            elif cls.is_recent and config.CBDOC_DEFER_RECENT:
+                # Optional: park recent partial/no-balance until fraud_time+buffer
+                # (only if CBDOC_DEFER_RECENT=true). Default is immediate reconcile
+                # since debits now come from the live DD enquiry.
+                wake = _cbdoc_wake_time(incidents)
+                p.next_attempt_at = wake
+                p.processing_state = ST_AWAITING_CBDOC
+                p.lease_expires_at = None
+                log.info("[%s] recent fraud, remaining=%s -> AWAITING_CBDOC until %s",
+                         p.acknowledgement_no, remaining, wake.isoformat())
+                s.add(p); s.commit()
+                break
+            else:
+                p.processing_state = ST_RECONCILING
+
+        elif st == ST_AWAITING_CBDOC:
+            # Woken at/after wake time (only used when CBDOC_DEFER_RECENT=true).
+            p.next_attempt_at = None
+            p.processing_state = ST_RECONCILING
 
         elif st == ST_RECONCILING:
             remaining = Decimal(_unstash(s, p, "REMAINING").get("value", "0"))
-            traced, reconciled = _trace_and_collect(s, p, incidents, remaining)
+            traced, reconciled = _reconcile_credit_from_dd(s, p, incidents, remaining)
             _finalize(s, p, instrument, incidents, traced_txns=traced)
             p.processing_state = ST_RESOLVED if reconciled else ST_NEEDS_REVIEW
             if not reconciled:
-                p.last_error = "CBDOC account debits did not reconcile the disputed amount"
+                p.last_error = "debits did not reconcile the disputed amount"
             p.lease_expires_at = None
             s.add(p); s.commit()
             break
@@ -841,6 +862,212 @@ def _apply_holds(s: Session, p: ComplaintProcessing, instrument: Instrument,
 # Money-trail trace + collection
 # ===========================================================================
 
+def _txn_amount(txn: dict) -> Decimal:
+    """Signed transaction amount from a DD-enquiry txn. Debit is negative."""
+    a = _dig(txn, "transactionAmount.amount")
+    try:
+        return Decimal(str(a)) if a not in (None, "") else Decimal("0")
+    except Exception:
+        return Decimal("0")
+
+
+def _is_debit_txn(txn: dict) -> bool:
+    """A debit = money leaving the account = negative transactionAmount."""
+    return _txn_amount(txn) < 0
+
+
+def _txn_time(txn: dict) -> datetime:
+    """Transaction time (tz-aware UTC) from executionTimestamp, else value/post
+    date. datetime.min(UTC) if nothing usable."""
+    ts = _dig(txn, "transactionId.executionTimestamp")
+    if ts:
+        try:
+            dt = datetime.fromisoformat(str(ts))
+            dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    for k in ("valueDate", "postDate"):
+        d = txn.get(k)
+        if d:
+            try:
+                return datetime.fromisoformat(str(d)).replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _fmt_txn_time(txn: dict) -> str:
+    dt = _txn_time(txn)
+    m = datetime.min.replace(tzinfo=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt != m else ""
+
+
+def _classify_rrn(token: str, payer_digits: str) -> Optional[tuple[str, str]]:
+    """Classify a narrative token as an RRN. Returns (rrn, type) or None.
+      HSBCN...  -> NEFT
+      HSBCR...  -> RTGS
+      12 digits -> UPI   (unless it's the payer's own account number)
+    """
+    t = (token or "").strip()
+    if not t:
+        return None
+    up = t.upper()
+    if up.startswith("HSBCN"):
+        return (t, "NEFT")
+    if up.startswith("HSBCR"):
+        return (t, "RTGS")
+    if t.isdigit() and len(t) == 12:
+        if payer_digits and t in payer_digits:      # payer's own account, not an RRN
+            return None
+        return (t, "UPI")
+    return None
+
+
+def _extract_rrns(txn: dict, payer_digits: str) -> list[tuple[str, str]]:
+    """All classifiable RRNs from a txn's narratives, de-duplicated, order-preserved."""
+    out: dict[str, str] = {}
+    for nv in _narratives(txn):
+        for tok in re.split(r"[/\s,;|]+", nv):
+            c = _classify_rrn(tok, payer_digits)
+            if c and c[0] not in out:
+                out[c[0]] = c[1]
+    return list(out.items())
+
+
+def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
+                  account: str, amount: Decimal, ts_iso: str) -> dict:
+    """Fetch bene details for one RRN: UPI -> UPI API; NEFT/RTGS -> CBDOC by LPUTRN.
+    Idempotent, non-fatal (returns {} on failure)."""
+    if rtype == "UPI":
+        idem = f"UPI:{p.acknowledgement_no}:{rrn}"
+        step = _step_get(s, p, "UPI_BENE", idem)
+        if not step:
+            try:
+                resp = gateway().upi_bene_lookup(
+                    rrn=rrn, account_number=account, amount=str(amount),
+                    transaction_timestamp=ts_iso)
+                step = _step_record(s, p, "UPI_BENE", idem, {"rrn": rrn}, resp)
+            except GatewayError as e:
+                log.warning("[%s] UPI bene failed rrn=%s: %s", p.acknowledgement_no, rrn, e)
+                return {}
+        return _normalise_bene(_dig(step.response_payload, "data") or {})
+
+    # NEFT / RTGS -> CBDOC, filter by LPUTRN (BQ_FIELD_REF)
+    idem = f"CBDOCBENE:{p.acknowledgement_no}:{rrn}"
+    step = _step_get(s, p, "CBDOC_BENE", idem)
+    if not step:
+        try:
+            resp = gateway().bigquery_search({config.BQ_FIELD_REF: rrn}, limit=5)
+            step = _step_record(s, p, "CBDOC_BENE", idem, {config.BQ_FIELD_REF: rrn}, resp)
+        except GatewayError as e:
+            log.warning("[%s] CBDOC bene failed rrn=%s: %s", p.acknowledgement_no, rrn, e)
+            return {}
+    rows = _rows(step.response_payload)
+    row = rows[0] if rows else {}
+    return {
+        "account": _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
+        "bank": row.get("OGBEA1", ""),
+        "name": row.get("OGBEA1", ""),
+        "ifsc": "", "bankCode": "", "vpa": "",
+    }
+
+
+def _mha_debit_obj(rrn: str, rtype: str, amount: Decimal, txn: dict,
+                   bene: dict, root: dict, disputed: Decimal) -> dict:
+    """One MHA 'Money Transfer To' object for a traced debit RRN + its bene."""
+    return {
+        "rrn_transaction_id": rrn,
+        "rrn_type": rtype,                       # NEFT / RTGS / UPI
+        "payee_bank": bene.get("bank", ""),
+        "payee_bank_code": bene.get("bankCode", ""),
+        "payee_account_number": bene.get("account", ""),
+        "payee_name": bene.get("name", ""),
+        "payee_vpa": bene.get("vpa", ""),
+        "ifsc_code": bene.get("ifsc", ""),
+        "amount": str(amount),
+        "disputed_amount": str(disputed),
+        "transaction_datetime": _fmt_txn_time(txn),
+        "txn_type": "Money Transfer To",
+        "txn_type_id": "3",
+        "phone_number": "", "email": "", "pan_number": "",
+        "root_account_number": root["root_account_number"],
+        "root_rrn_transaction_id": root["root_rrn_transaction_id"],
+        "root_bankid": root["root_bankid"],
+        "status_code": "00", "remarks": "",
+        "root_effective_balance": root["root_effective_balance"],
+        "root_ifsc_code": root["root_ifsc_code"],
+    }
+
+
+def _min_incident_utc(incidents: list[Incident]) -> datetime:
+    fraud_ist = min((_incident_dt(inc) for inc in incidents), default=datetime.min)
+    return fraud_ist.replace(tzinfo=_IST).astimezone(timezone.utc)
+
+
+def _reconcile_credit_from_dd(s: Session, p: ComplaintProcessing,
+                              incidents: list[Incident],
+                              remaining: Decimal) -> tuple[list[dict], bool]:
+    """Reconcile a CREDIT fraud from the DD transaction enquiry.
+
+      1. Reuse the DD enquiry transaction list.
+      2. Anchor on the credit (fraud RRN) transaction time.
+      3. Walk DEBITS (negative amount) after the credit, chronologically,
+         accumulating |amount| until `remaining` is reconciled.
+      4. From each debit's narratives, extract RRNs and classify NEFT/RTGS/UPI.
+      5. UPI -> UPI API bene; NEFT/RTGS -> CBDOC(LPUTRN) bene.
+      6. Return the collated MHA objects + reconciled flag."""
+    inst = p.complaint.instrument
+    account = inst.payer_account_number
+    payer_digits = re.sub(r"\D", "", account or "")
+    from_date = min(i.transaction_date for i in incidents).isoformat()
+
+    resp = _txn_enquiry(s, p, account, from_date)
+    details = _dig(resp, config.TXN_DETAILS_PATH) or _deep_find_txn_list(resp)
+
+    fraud_refs = [inc.merchant_id for inc in incidents]
+    credit = None
+    for ref in fraud_refs:
+        credit = _find_txn_by_rrn(details, ref)
+        if credit:
+            break
+    anchor = _txn_time(credit) if credit else _min_incident_utc(incidents)
+    log.info("[%s] DD reconcile: %d txns, anchor=%s (credit %sfound)",
+             p.acknowledgement_no, len(details), anchor.isoformat(),
+             "" if credit else "NOT ")
+
+    debits = sorted((t for t in details if _is_debit_txn(t)), key=_txn_time)
+    objs: list[dict] = []
+    recovered = Decimal("0")
+    root = _root_ctx(s, p)
+    disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
+    seen: set[str] = set()
+
+    for txn in debits:
+        if _txn_time(txn) < anchor:          # only debits at/after the credit
+            continue
+        amt = abs(_txn_amount(txn))
+        if amt <= 0:
+            continue
+        ts_iso = _fmt_txn_time(txn)
+        for rrn, rtype in _extract_rrns(txn, payer_digits):
+            if rrn in seen:
+                continue
+            seen.add(rrn)
+            bene = _bene_for_rrn(s, p, rrn, rtype, account, amt, ts_iso)
+            objs.append(_mha_debit_obj(rrn, rtype, amt, txn, bene, root, disputed))
+            log.info("[%s] traced debit rrn=%s type=%s amount=%s",
+                     p.acknowledgement_no, rrn, rtype, amt)
+        recovered += amt
+        if recovered >= remaining:
+            break
+
+    fully = recovered >= remaining
+    log.info("[%s] DD reconcile done: objs=%d recovered=%s remaining=%s reconciled=%s",
+             p.acknowledgement_no, len(objs), recovered, remaining, fully)
+    return objs, fully
+
+
 def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incident],
                        remaining: Decimal) -> tuple[list[dict], bool]:
     """CBDOC reconciliation for a CREDIT fraud.
@@ -926,7 +1153,7 @@ def _cbdoc_account_debits(s: Session, p: ComplaintProcessing, account: str,
     IMPORTANT: BQ_FIELD_ACCOUNT must be the CBDOC column holding the account whose
     outgoing debits you want. If the account search returns 0, a probe logs the
     fraud row's fields so the right column can be identified."""
-    idem = f"CBDOCDEBITS:{p.acknowledgement_no}:{account}"
+    idem = f"CBDOCDEBITS:{p.acknowledgement_no}:{account}:{p.defer_count}"
     existing = _step_get(s, p, "BQ_TRACE", idem)
     if existing and existing.status == "SUCCESS":
         return _rows(existing.response_payload or {})
@@ -1020,6 +1247,17 @@ def _row_dt(row: dict) -> datetime:
                         int(ts6[0:2]), int(ts6[2:4]), int(ts6[4:6]))
     except Exception:
         return datetime.min
+
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _cbdoc_wake_time(incidents: list[Incident]) -> datetime:
+    """fraud transaction_time (IST) + CBDOC_BUFFER_HOURS, returned as tz-aware UTC.
+    Uses the earliest incident's time."""
+    fraud_ist_naive = min((_incident_dt(inc) for inc in incidents), default=datetime.min)
+    fraud_ist = fraud_ist_naive.replace(tzinfo=_IST)
+    return fraud_ist.astimezone(timezone.utc) + timedelta(hours=config.CBDOC_BUFFER_HOURS)
 
 
 def _incident_dt(inc: Incident) -> datetime:
