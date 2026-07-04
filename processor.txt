@@ -315,6 +315,10 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
         elif st == ST_BALANCE_CHECKED:
             balance = _available_balance(s, p, account)
             held, remaining = _apply_holds(s, p, instrument, total_disputed, balance)
+            # root_effective_balance = balance remaining in the account AFTER the
+            # hold (available balance minus the amount we just held).
+            post_hold_balance = balance - held
+            _stash(s, p, "BALANCE", {"value": str(post_hold_balance)})
             _stash(s, p, "REMAINING", {"value": str(remaining), "held": str(held)})
             p.processing_state = ST_HOLD_APPLIED
 
