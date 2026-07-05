@@ -82,7 +82,11 @@ HOLD_TILL_DATE = _env("HOLD_TILL_DATE", "2099-12-31")
 HOLD_CURRENCY  = _env("HOLD_CURRENCY", "INR")
 
 # --- BigQuery (CBDOC) field mapping (confirmed against a real CBDOC row) ---
-BQ_FIELD_REF          = _env("BQ_FIELD_REF", "LPUTRN")     # UTR/RRN (NOT OGTRNO)
+BQ_FIELD_REF          = _env("BQ_FIELD_REF", "LPUTRN")     # UTR/RRN column read FROM a row
+# Column to FILTER on when searching CBDOC by UTR/RRN. This must be LPUTRN (the
+# real UTR); OGTRNO holds an unrelated internal ref. Kept separate from
+# BQ_FIELD_REF so a stale env can't misroute the search.
+BQ_SEARCH_REF_FIELD   = _env("BQ_SEARCH_REF_FIELD", "LPUTRN")
 BQ_FIELD_AMOUNT       = _env("BQ_FIELD_AMOUNT", "OGPYAM")
 BQ_FIELD_DATE         = _env("BQ_FIELD_DATE", "OGCPDT")
 BQ_FIELD_TIME         = _env("BQ_FIELD_TIME", "OGCPTM")

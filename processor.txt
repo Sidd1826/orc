@@ -514,7 +514,7 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
             bqidem = f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}"
             if _step_get(s, p, "CBDOC_BENE", bqidem):
                 continue
-            bq = gateway().bigquery_search({config.BQ_FIELD_REF: inc.merchant_id}, limit=5)
+            bq = gateway().bigquery_search({config.BQ_SEARCH_REF_FIELD: inc.merchant_id}, limit=5)
             _step_record(s, p, "CBDOC_BENE", bqidem, {config.BQ_FIELD_REF: inc.merchant_id}, bq)
             n = len(_rows(bq))
             log.info("[%s] CBDOC bene lookup by UTR=%s -> %d rows",
@@ -1000,7 +1000,7 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
     step = _step_get(s, p, "CBDOC_BENE", idem)
     if not step:
         try:
-            resp = gateway().bigquery_search({config.BQ_FIELD_REF: rrn}, limit=5)
+            resp = gateway().bigquery_search({config.BQ_SEARCH_REF_FIELD: rrn}, limit=5)
             step = _step_record(s, p, "CBDOC_BENE", idem, {config.BQ_FIELD_REF: rrn}, resp)
         except GatewayError as e:
             log.warning("[%s] CBDOC bene failed rrn=%s: %s", p.acknowledgement_no, rrn, e)
@@ -1008,8 +1008,8 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
     rows = _rows(step.response_payload)
     row = rows[0] if rows else {}
     if not row:
-        log.warning("[%s] CBDOC bene: 0 rows for %s=%s (resp keys=%s)",
-                    p.acknowledgement_no, config.BQ_FIELD_REF, rrn,
+        log.warning("[%s] CBDOC bene: 0 rows searching %s=%s (resp keys=%s)",
+                    p.acknowledgement_no, config.BQ_SEARCH_REF_FIELD, rrn,
                     list(step.response_payload.keys()) if isinstance(step.response_payload, dict) else type(step.response_payload).__name__)
     # Beneficiary name = OGBEA1..OGBEA4 lines joined; account = OGBEAC (strip '/').
     name = " ".join(
@@ -1024,6 +1024,7 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
         "bankCode": "",
         "vpa": "",
         "currency": row.get("OGPYCY", ""),
+        "txn_datetime": _fmt_row_dt(row),          # OGTMZ1 -> response transaction_datetime
         "narratives": [row.get(k) for k in ("OGNAR1", "OGNAR2", "OGNAR3", "OGNAR4") if row.get(k)],
     }
     log.info("[%s] CBDOC bene rrn=%s -> account=%s name=%s",
@@ -1049,7 +1050,7 @@ def _mha_debit_obj(rrn: str, rtype: str, amount: Decimal, txn: dict,
         "ifsc_code": bene.get("ifsc", ""),
         "amount": str(amount),
         "disputed_amount": str(disputed),
-        "transaction_datetime": _fmt_txn_time(txn),
+        "transaction_datetime": bene.get("txn_datetime") or _fmt_txn_time(txn),
         "txn_type": "Money Transfer To",
         "txn_type_id": "3",
         "phone_number": "", "email": "", "pan_number": "",
@@ -1247,7 +1248,7 @@ def _cbdoc_probe(s: Session, p: ComplaintProcessing, incidents: list[Incident]) 
     the correct account value) — the single mapping this reconciliation needs."""
     for inc in incidents:
         try:
-            resp = gateway().bigquery_search({config.BQ_FIELD_REF: inc.merchant_id}, limit=5)
+            resp = gateway().bigquery_search({config.BQ_SEARCH_REF_FIELD: inc.merchant_id}, limit=5)
         except Exception as e:                      # noqa: BLE001
             log.warning("[%s] CBDOC probe by %s=%s failed: %s",
                         p.acknowledgement_no, config.BQ_FIELD_REF, inc.merchant_id, e)
@@ -1526,8 +1527,7 @@ def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Inc
             "payee_account_number": _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
             "payee_name": name,
             "amount": str(inc.amount),
-            "transaction_datetime": _fmt_dt(row.get(config.BQ_FIELD_DATE),
-                                            row.get(config.BQ_FIELD_TIME))
+            "transaction_datetime": _fmt_row_dt(row)
                                     or f"{inc.transaction_date} {inc.transaction_time}",
             "disputed_amount": str(inc.disputed_amount),
             "ifsc_code": str(row.get(config.BQ_FIELD_IFSC, "") or "").strip(),
