@@ -908,15 +908,16 @@ def _fmt_txn_time(txn: dict) -> str:
 
 
 def _scheme_from_narratives(txn: dict) -> Optional[str]:
-    """Detect the payment scheme from a transaction's narratives (a standalone
-    tag like 'IMPS', 'UPI', 'NEFT', 'RTGS' usually sits next to the RRN).
-    Returns the scheme or None if no tag is present."""
+    """Detect the payment scheme from a transaction's narratives.
+    A scheme tag may be a bare token ('UPI', 'IMPS') OR a prefixed string
+    like 'UPI2026063000015887a'. The tag is separate from the numeric RRN."""
     for nv in _narratives(txn):
         u = nv.strip().upper()
-        for scheme in ("IMPS", "UPI", "NEFT", "RTGS"):
-            # match as a standalone token, not a substring of the RRN
-            if u == scheme or scheme in re.split(r"[/\s,;|]+", u):
-                return scheme
+        for tok in re.split(r"[/\s,;|]+", u):
+            for scheme in ("IMPS", "UPI", "NEFT", "RTGS"):
+                # bare token, or a token that starts with the scheme (e.g. UPI2026...)
+                if tok == scheme or tok.startswith(scheme):
+                    return scheme
     return None
 
 
@@ -1006,12 +1007,27 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
             return {}, rtype, "resolved"
     rows = _rows(step.response_payload)
     row = rows[0] if rows else {}
+    if not row:
+        log.warning("[%s] CBDOC bene: 0 rows for %s=%s (resp keys=%s)",
+                    p.acknowledgement_no, config.BQ_FIELD_REF, rrn,
+                    list(step.response_payload.keys()) if isinstance(step.response_payload, dict) else type(step.response_payload).__name__)
+    # Beneficiary name = OGBEA1..OGBEA4 lines joined; account = OGBEAC (strip '/').
+    name = " ".join(
+        str(row.get(k, "")).strip() for k in ("OGBEA1", "OGBEA2", "OGBEA3", "OGBEA4")
+        if str(row.get(k, "")).strip()
+    )
     bene = {
-        "account": _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
-        "bank": row.get("OGBEA1", ""),
-        "name": row.get("OGBEA1", ""),
-        "ifsc": "", "bankCode": "", "vpa": "",
+        "account": _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),   # OGBEAC
+        "bank": "",                                                          # no bank column in CBDOC
+        "name": name,                                                        # OGBEA1..OGBEA4
+        "ifsc": str(row.get(config.BQ_FIELD_IFSC, "") or "").strip(),
+        "bankCode": "",
+        "vpa": "",
+        "currency": row.get("OGPYCY", ""),
+        "narratives": [row.get(k) for k in ("OGNAR1", "OGNAR2", "OGNAR3", "OGNAR4") if row.get(k)],
     }
+    log.info("[%s] CBDOC bene rrn=%s -> account=%s name=%s",
+             p.acknowledgement_no, rrn, bene["account"], bene["name"][:40])
     return bene, rtype, "resolved"
 
 
@@ -1253,8 +1269,23 @@ def _cbdoc_probe(s: Session, p: ComplaintProcessing, incidents: list[Incident]) 
                 incidents[0].merchant_id if incidents else "?", config.BQ_FIELD_REF)
 
 
-def _rows(bq_resp: dict) -> list[dict]:
-    return bq_resp.get("rows", []) if isinstance(bq_resp, dict) else []
+def _rows(bq_resp: Any) -> list[dict]:
+    """Extract the CBDOC row list, tolerant of response shape:
+      {"rows":[...]}            (gateway direct)
+      {"data":{"rows":[...]}}   (data-enveloped)
+      [ ... ]                   (bare list)
+    """
+    if isinstance(bq_resp, list):
+        return bq_resp
+    if isinstance(bq_resp, dict):
+        if isinstance(bq_resp.get("rows"), list):
+            return bq_resp["rows"]
+        data = bq_resp.get("data")
+        if isinstance(data, dict) and isinstance(data.get("rows"), list):
+            return data["rows"]
+        if isinstance(data, list):
+            return data
+    return []
 
 
 def _row_amount(row: dict) -> Decimal:
@@ -1484,18 +1515,22 @@ def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Inc
         step = _step_get(s, p, "CBDOC_BENE", f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}")
         rows = _rows(step.response_payload) if step and step.response_payload else []
         row = rows[0] if rows else {}
+        name = " ".join(
+            str(row.get(k, "")).strip() for k in ("OGBEA1", "OGBEA2", "OGBEA3", "OGBEA4")
+            if str(row.get(k, "")).strip()
+        )
         txns.append({
             "rrn_transaction_id": inc.merchant_id,
-            "payee_bank": row.get("OGBEA1", ""),
+            "payee_bank": "",
             "payee_bank_code": "",
-            "payee_account_number": row.get(config.BQ_FIELD_BENE_ACCOUNT, ""),
-            "payee_name": row.get("OGBEA1", ""),
+            "payee_account_number": _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
+            "payee_name": name,
             "amount": str(inc.amount),
             "transaction_datetime": _fmt_dt(row.get(config.BQ_FIELD_DATE),
                                             row.get(config.BQ_FIELD_TIME))
                                     or f"{inc.transaction_date} {inc.transaction_time}",
             "disputed_amount": str(inc.disputed_amount),
-            "ifsc_code": "",
+            "ifsc_code": str(row.get(config.BQ_FIELD_IFSC, "") or "").strip(),
             "txn_type": "Money Transfer To",
             "txn_type_id": "3",
             "phone_number": "",

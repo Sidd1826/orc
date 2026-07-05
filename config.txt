@@ -95,6 +95,9 @@ BQ_FIELD_TIMESTAMP    = _env("BQ_FIELD_TIMESTAMP", "OGTMZ1")
 BQ_FIELD_ACCOUNT      = _env("BQ_FIELD_ACCOUNT", "OGBEAC")
 BQ_ACCOUNT_PREFIX     = _env("BQ_ACCOUNT_PREFIX", "/")
 BQ_FIELD_BENE_ACCOUNT = _env("BQ_FIELD_BENE_ACCOUNT", "OGBEAC")
+# CBDOC column holding the beneficiary IFSC, if any. Your sample row has no IFSC
+# column, so this defaults empty; set it if your table carries one.
+BQ_FIELD_IFSC         = _env("BQ_FIELD_IFSC", "")
 CBDOC_MAX_ROWS        = _env_int("CBDOC_MAX_ROWS", 500)
 
 # Optional debit/credit indicator in CBDOC. If your table mixes debits and
