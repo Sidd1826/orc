@@ -34,6 +34,66 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() == "true" if raw else default
 
 
+# --------------------------------------------------------------------------
+# GCP Secret Manager loader.
+#
+# On Cloud Run, sensitive values live in Secret Manager rather than plaintext
+# env vars. This fetches each secret at startup and injects it into os.environ
+# BEFORE the settings below are read, so every `_env(...)` call picks it up
+# unchanged — no other code needs to know where the value came from.
+#
+# Behaviour:
+#   - No-ops locally (runs only when GOOGLE_CLOUD_PROJECT is set), so `.env`
+#     keeps working for local dev.
+#   - An already-present env var wins (lets --set-env-vars / local override a
+#     secret, useful for testing).
+#   - Missing/denied secret -> hard fail at startup (better than running
+#     half-configured). Make every name below exist in Secret Manager, or drop
+#     it from the map.
+#
+# SECRETS_TO_LOAD maps: ENV_VAR_NAME -> SECRET_NAME_IN_SECRET_MANAGER
+# (the two can differ if your secret is named differently from the env var).
+# --------------------------------------------------------------------------
+SECRETS_TO_LOAD: dict[str, str] = {
+    # The orchestrator authenticates to the gateway via OIDC (automatic on
+    # Cloud Run) and delegates all UPI/HSBC crypto to the gateway, so its only
+    # real secret is usually the DB password. Add more here only if THIS app
+    # reads them directly.
+    "PG_PASSWORD": "PG_PASSWORD",
+}
+
+
+def _load_secrets_from_gcp() -> None:
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+    if not project_id or not SECRETS_TO_LOAD:
+        return
+
+    try:
+        from google.cloud import secretmanager
+    except ImportError as e:
+        raise RuntimeError(
+            "google-cloud-secret-manager is not installed. "
+            "Add 'google-cloud-secret-manager' to requirements.txt."
+        ) from e
+
+    client = secretmanager.SecretManagerServiceClient()
+    for env_var, secret_name in SECRETS_TO_LOAD.items():
+        if os.environ.get(env_var):          # already set -> don't override
+            continue
+        try:
+            path = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+            resp = client.access_secret_version(request={"name": path})
+            os.environ[env_var] = resp.payload.data.decode("utf-8").strip()
+        except Exception as e:               # noqa: BLE001
+            raise RuntimeError(
+                f"Failed to load secret '{secret_name}' from Secret Manager: {e}"
+            ) from e
+
+
+# Must run BEFORE the settings below are evaluated.
+_load_secrets_from_gcp()
+
+
 # --- Postgres (host/user/password — same as your DBeaver connection) ---
 # Local/TCP : PG_HOST=localhost (or the DB's IP)
 # Cloud Run : PG_HOST=/cloudsql/PROJECT:REGION:INSTANCE  (unix socket)
