@@ -6,3 +6,5 @@ python-dotenv==1.0.1
 SQLAlchemy==2.0.36
 pg8000==1.31.2
 google-auth==2.37.0
+google-cloud-secret-manager==2.20.2
+pycryptodome==3.20.0

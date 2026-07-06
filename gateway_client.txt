@@ -205,3 +205,10 @@ class GatewayClient:
         body = dict(filters)
         body["limit"] = limit
         return self._request("POST", "/api/v1/search", json_body=body)
+
+    # ------------------------------------------------------------------
+    # Send the encrypted final response to MHA (via the gateway).
+    # `encrypted` is {"iv": "...", "encrypted_data": "..."}.
+    # ------------------------------------------------------------------
+    def mha_response(self, encrypted: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", config.MHA_RESPONSE_PATH, json_body=encrypted)

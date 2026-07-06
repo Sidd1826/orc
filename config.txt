@@ -60,6 +60,8 @@ SECRETS_TO_LOAD: dict[str, str] = {
     # real secret is usually the DB password. Add more here only if THIS app
     # reads them directly.
     "PG_PASSWORD": "PG_PASSWORD",
+    # AES-256 key (base64) for encrypting the final MHA response payload.
+    "MHA_RESPONSE_KEY_B64": "MHA_RESPONSE_KEY_B64",
 }
 
 
@@ -187,3 +189,10 @@ MAX_CBDOC_DEFERS   = _env_int("MAX_CBDOC_DEFERS", 3)
 # (available immediately), so recent frauds no longer need to wait for CBDOC T+1.
 # Set true to re-enable the 28h defer for recent partial/no-balance cases.
 CBDOC_DEFER_RECENT = _env("CBDOC_DEFER_RECENT", "false").lower() == "true"
+
+# --- MHA response encryption (AES-256-CBC) ---
+# Base64-encoded 32-byte key. Loaded from Secret Manager on Cloud Run; never
+# hard-code it. If empty, encryption is skipped (dev/local only).
+MHA_RESPONSE_KEY_B64 = _env("MHA_RESPONSE_KEY_B64", "")
+# Gateway endpoint that forwards the encrypted response to MHA.
+MHA_RESPONSE_PATH = _env("MHA_RESPONSE_PATH", "/api/v1/mha-response")

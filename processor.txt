@@ -36,6 +36,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import config
+import encryption
 from classifier import CHANNEL_UPI, DIR_CREDIT, DIR_DEBIT, classify
 from db import session_scope
 from gateway_client import GatewayClient, GatewayError
@@ -1612,3 +1613,42 @@ def _write_response_log(s: Session, p: ComplaintProcessing, payload: dict,
     s.flush()
     log.info("[%s] response log written job_id=%s txns=%d",
              p.acknowledgement_no, p.job_id, len(payload.get("transactions", [])))
+
+    # Encrypt and send the final response to MHA (via the gateway). Every
+    # finalizer funnels through here, so all paths send consistently.
+    _send_mha_response(s, p, payload)
+
+
+def _send_mha_response(s: Session, p: ComplaintProcessing, payload: dict) -> None:
+    """Encrypt the response payload and POST it to the gateway's MHA-response
+    endpoint. Idempotent (skips if already sent) and non-fatal: a send failure
+    is logged and recorded, not raised, so the complaint isn't reprocessed just
+    because the downstream call hiccuped. Retry is handled separately."""
+    idem = f"MHARESP:{p.acknowledgement_no}:{p.job_id}"
+    prior = _step_get(s, p, "MHA_RESPONSE", idem)
+    if prior and prior.status == "SUCCESS":
+        return
+
+    if not encryption.is_enabled():
+        log.warning("[%s] MHA response NOT sent: MHA_RESPONSE_KEY_B64 unset (dev mode)",
+                    p.acknowledgement_no)
+        return
+
+    try:
+        encrypted = encryption.encrypt_payload(payload)
+    except Exception as e:                       # noqa: BLE001
+        log.error("[%s] MHA response encryption failed: %s", p.acknowledgement_no, e)
+        _step_record(s, p, "MHA_RESPONSE", idem, {"acknowledgement_no": p.acknowledgement_no},
+                     {"error": f"encrypt: {e}"}, status="FAILURE")
+        return
+
+    try:
+        res = gateway().mha_response(encrypted)
+        _step_record(s, p, "MHA_RESPONSE", idem,
+                     {"acknowledgement_no": p.acknowledgement_no}, res)
+        log.info("[%s] MHA response sent OK", p.acknowledgement_no)
+    except GatewayError as e:
+        log.error("[%s] MHA response send failed (non-fatal): %s", p.acknowledgement_no, e)
+        _step_record(s, p, "MHA_RESPONSE", idem,
+                     {"acknowledgement_no": p.acknowledgement_no},
+                     {"error": str(e)}, status="FAILURE")

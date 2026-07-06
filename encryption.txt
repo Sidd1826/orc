@@ -1,0 +1,58 @@
+"""
+encryption.py — AES-256-CBC encryption for the final MHA response payload.
+
+The key is a base64-encoded 32-byte value provided via config (Secret Manager on
+Cloud Run). NEVER hard-code the key here.
+
+Output shape (what the gateway's mha-response endpoint expects):
+    {"iv": "<base64>", "encrypted_data": "<base64>"}
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+from typing import Any
+
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+
+import config
+
+IV_SIZE = 16  # AES block size (CBC)
+
+
+def _key() -> bytes:
+    """Return the raw 32-byte AES key, validating length. Raises if unset/bad."""
+    b64 = config.MHA_RESPONSE_KEY_B64
+    if not b64:
+        raise RuntimeError(
+            "MHA_RESPONSE_KEY_B64 is not set. Provide the base64 AES-256 key "
+            "via env var / Secret Manager."
+        )
+    try:
+        key = base64.b64decode(b64)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"MHA_RESPONSE_KEY_B64 is not valid base64: {e}") from e
+    if len(key) != 32:
+        raise RuntimeError(
+            f"MHA_RESPONSE_KEY_B64 must decode to 32 bytes (AES-256); got {len(key)}."
+        )
+    return key
+
+
+def encrypt_payload(payload: dict[str, Any]) -> dict[str, str]:
+    """AES-256-CBC encrypt a JSON payload. Returns {iv, encrypted_data} (base64)."""
+    plain = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    iv = os.urandom(IV_SIZE)
+    cipher = AES.new(_key(), AES.MODE_CBC, iv)
+    ct = cipher.encrypt(pad(plain.encode("utf-8"), AES.block_size))
+    return {
+        "iv": base64.b64encode(iv).decode("utf-8"),
+        "encrypted_data": base64.b64encode(ct).decode("utf-8"),
+    }
+
+
+def is_enabled() -> bool:
+    """True if an encryption key is configured (so callers can skip locally)."""
+    return bool(config.MHA_RESPONSE_KEY_B64)
