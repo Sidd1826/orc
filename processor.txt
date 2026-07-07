@@ -329,29 +329,35 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
                 # Full hold covered the disputed amount -> respond now, done.
                 _finalize(s, p, instrument, incidents, traced_txns=[])
                 p.processing_state = ST_RESOLVED
-            elif cls.is_recent and config.CBDOC_DEFER_RECENT:
-                # Optional: park recent partial/no-balance until fraud_time+buffer
-                # (only if CBDOC_DEFER_RECENT=true). Default is immediate reconcile
-                # since debits now come from the live DD enquiry.
-                wake = _cbdoc_wake_time(incidents)
-                p.next_attempt_at = wake
-                p.processing_state = ST_AWAITING_CBDOC
-                p.lease_expires_at = None
-                log.info("[%s] recent fraud, remaining=%s -> AWAITING_CBDOC until %s",
-                         p.acknowledgement_no, remaining, wake.isoformat())
-                s.add(p); s.commit()
-                break
             else:
                 p.processing_state = ST_RECONCILING
 
         elif st == ST_AWAITING_CBDOC:
-            # Woken at/after wake time (only used when CBDOC_DEFER_RECENT=true).
+            # Parked because a NEFT/RTGS leg needed CBDOC data that wasn't there
+            # yet (recent fraud, CBDOC is T+1). Woken next morning -> reconcile
+            # again; CBDOC should now have the data.
             p.next_attempt_at = None
             p.processing_state = ST_RECONCILING
 
         elif st == ST_RECONCILING:
             remaining = Decimal(_unstash(s, p, "REMAINING").get("value", "0"))
-            traced, reconciled = _reconcile_credit_from_dd(s, p, incidents, remaining)
+            traced, reconciled, cbdoc_pending = _reconcile_credit_from_dd(
+                s, p, incidents, remaining)
+
+            # A NEFT/RTGS leg needed CBDOC bene but it wasn't there yet, AND the
+            # fraud is recent (CBDOC is T+1). Park and retry next morning at 10am
+            # IST. UPI legs never trigger this — they have no 24h restriction.
+            if cbdoc_pending and cls.is_recent and p.defer_count < config.MAX_CBDOC_DEFERS:
+                wake = _cbdoc_wake_time(incidents)
+                p.defer_count += 1
+                p.next_attempt_at = wake
+                p.processing_state = ST_AWAITING_CBDOC
+                p.lease_expires_at = None
+                log.info("[%s] NEFT/RTGS bene not in CBDOC yet (recent); retry #%d at %s",
+                         p.acknowledgement_no, p.defer_count, wake.isoformat())
+                s.add(p); s.commit()
+                break
+
             _finalize(s, p, instrument, incidents, traced_txns=traced)
             p.processing_state = ST_RESOLVED if reconciled else ST_NEEDS_REVIEW
             if not reconciled:
@@ -446,6 +452,7 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
             resp = gateway().upi_bene_lookup(
                 rrn=inc.merchant_id, account_number=account,
                 amount=str(inc.amount), transaction_timestamp=ts,
+                ack_id=p.acknowledgement_no,
             )
             _step_record(s, p, "UPI_BENE", idem, {"rrn": inc.merchant_id}, resp)
         return
@@ -572,6 +579,7 @@ def _upi_bene_if_required(s: Session, p: ComplaintProcessing, inc: Incident,
         resp = gateway().upi_bene_lookup(
             rrn=inc.merchant_id, account_number=account,
             amount=str(inc.amount), transaction_timestamp=ts,
+            ack_id=p.acknowledgement_no,
         )
         _step_record(s, p, "UPI_BENE", idem, {"rrn": inc.merchant_id}, resp)
         log.info("[%s] UPI bene fetched for RRN=%s", p.acknowledgement_no, inc.merchant_id)
@@ -935,10 +943,13 @@ def _classify_rrn(token: str, payer_digits: str,
     if not t:
         return None
     up = t.upper()
+    # NEFT/RTGS UTRs are 22 chars (e.g. HSBCN52026060900034931). Shorter HSBCN*/
+    # HSBCR* tokens (e.g. HSBCN16000034931, 16 chars) are internal refs, NOT the
+    # UTR — reject them so we don't create a duplicate transaction.
     if up.startswith("HSBCN"):
-        return (t, "NEFT")
+        return (t, "NEFT") if len(t) == config.UTR_LENGTH else None
     if up.startswith("HSBCR"):
-        return (t, "RTGS")
+        return (t, "RTGS") if len(t) == config.UTR_LENGTH else None
     if t.isdigit() and len(t) == 12:
         if payer_digits and t in payer_digits:      # payer's own account, not an RRN
             return None
@@ -981,7 +992,7 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
             try:
                 resp = gateway().upi_bene_lookup(
                     rrn=rrn, account_number=account, amount=str(amount),
-                    transaction_timestamp=ts_iso)
+                    transaction_timestamp=ts_iso, ack_id=p.acknowledgement_no)
                 step = _step_record(s, p, "UPI_BENE", idem, {"rrn": rrn}, resp)
             except GatewayError as e:
                 # UPI API rejected it -> not a UPI RRN -> treat as IMPS (ops).
@@ -996,13 +1007,14 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
             return {}, "IMPS", "ops_review"
         return _normalise_bene(data), "UPI", "resolved"
 
-    # NEFT / RTGS -> CBDOC by LPUTRN
-    idem = f"CBDOCBENE:{p.acknowledgement_no}:{rrn}"
+    # NEFT / RTGS -> CBDOC by LPUTRN. Include defer_count so each morning's
+    # retry re-queries CBDOC instead of reusing a cached empty result.
+    idem = f"CBDOCBENE:{p.acknowledgement_no}:{rrn}:{p.defer_count}"
     step = _step_get(s, p, "CBDOC_BENE", idem)
     if not step:
         try:
             resp = gateway().bigquery_search({config.BQ_SEARCH_REF_FIELD: rrn}, limit=5)
-            step = _step_record(s, p, "CBDOC_BENE", idem, {config.BQ_FIELD_REF: rrn}, resp)
+            step = _step_record(s, p, "CBDOC_BENE", idem, {config.BQ_SEARCH_REF_FIELD: rrn}, resp)
         except GatewayError as e:
             log.warning("[%s] CBDOC bene failed rrn=%s: %s", p.acknowledgement_no, rrn, e)
             return {}, rtype, "resolved"
@@ -1012,6 +1024,8 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
         log.warning("[%s] CBDOC bene: 0 rows searching %s=%s (resp keys=%s)",
                     p.acknowledgement_no, config.BQ_SEARCH_REF_FIELD, rrn,
                     list(step.response_payload.keys()) if isinstance(step.response_payload, dict) else type(step.response_payload).__name__)
+        # No CBDOC row yet — caller may retry (CBDOC is T+1 for recent frauds).
+        return {}, rtype, "cbdoc_empty"
     # Beneficiary name = OGBEA1..OGBEA4 lines joined; account = OGBEAC (strip '/').
     name = " ".join(
         str(row.get(k, "")).strip() for k in ("OGBEA1", "OGBEA2", "OGBEA3", "OGBEA4")
@@ -1108,6 +1122,7 @@ def _reconcile_credit_from_dd(s: Session, p: ComplaintProcessing,
     root = _root_ctx(s, p)
     disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
     seen: set[str] = set()
+    cbdoc_pending = False
 
     for txn in debits:
         if _txn_time(txn) < anchor:          # only debits at/after the credit
@@ -1121,10 +1136,17 @@ def _reconcile_credit_from_dd(s: Session, p: ComplaintProcessing,
                 continue
             seen.add(rrn)
             bene, final_type, status = _bene_for_rrn(s, p, rrn, rtype, account, amt, ts_iso)
-            objs.append(_mha_debit_obj(rrn, final_type, amt, txn, bene, root, disputed,
-                                       bene_status=status))
-            if status == "ops_review":
-                ops_pending += 1
+            if status == "cbdoc_empty":
+                # NEFT/RTGS bene not in CBDOC yet -> signal a retry. Emit the leg
+                # as pending so the amount still counts toward reconciliation.
+                cbdoc_pending = True
+                objs.append(_mha_debit_obj(rrn, final_type, amt, txn, bene, root, disputed,
+                                           bene_status="cbdoc_pending"))
+            else:
+                objs.append(_mha_debit_obj(rrn, final_type, amt, txn, bene, root, disputed,
+                                           bene_status=status))
+                if status == "ops_review":
+                    ops_pending += 1
             log.info("[%s] traced debit rrn=%s type=%s status=%s amount=%s",
                      p.acknowledgement_no, rrn, final_type, status, amt)
         recovered += amt                      # IMPS included: the money DID leave
@@ -1132,10 +1154,11 @@ def _reconcile_credit_from_dd(s: Session, p: ComplaintProcessing,
             break
 
     fully = recovered >= remaining
-    log.info("[%s] DD reconcile done: objs=%d ops_pending=%d recovered=%s "
-             "remaining=%s reconciled=%s",
-             p.acknowledgement_no, len(objs), ops_pending, recovered, remaining, fully)
-    return objs, fully
+    log.info("[%s] DD reconcile done: objs=%d ops_pending=%d cbdoc_pending=%s "
+             "recovered=%s remaining=%s reconciled=%s",
+             p.acknowledgement_no, len(objs), ops_pending, cbdoc_pending,
+             recovered, remaining, fully)
+    return objs, fully, cbdoc_pending
 
 
 def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incident],
@@ -1338,11 +1361,18 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def _cbdoc_wake_time(incidents: list[Incident]) -> datetime:
-    """fraud transaction_time (IST) + CBDOC_BUFFER_HOURS, returned as tz-aware UTC.
-    Uses the earliest incident's time."""
-    fraud_ist_naive = min((_incident_dt(inc) for inc in incidents), default=datetime.min)
-    fraud_ist = fraud_ist_naive.replace(tzinfo=_IST)
-    return fraud_ist.astimezone(timezone.utc) + timedelta(hours=config.CBDOC_BUFFER_HOURS)
+    """Next CBDOC retry time as tz-aware UTC.
+
+    CBDOC updates overnight (T+1), so recent (<24h) cases that need CBDOC are
+    retried the NEXT MORNING at CBDOC_RETRY_HOUR_IST (default 10:00 IST). If it's
+    already past that hour today, wake tomorrow; otherwise wake today at that hour.
+    """
+    now_ist = _now().astimezone(_IST)
+    target = now_ist.replace(hour=config.CBDOC_RETRY_HOUR_IST, minute=0,
+                             second=0, microsecond=0)
+    if now_ist >= target:
+        target = target + timedelta(days=1)
+    return target.astimezone(timezone.utc)
 
 
 def _incident_dt(inc: Incident) -> datetime:

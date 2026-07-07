@@ -186,7 +186,8 @@ class GatewayClient:
     # The gateway AES-encrypts this whole body before sending to HSBC.
     # ------------------------------------------------------------------
     def upi_bene_lookup(self, *, rrn: str, account_number: str,
-                        amount: str, transaction_timestamp: str) -> dict[str, Any]:
+                        amount: str, transaction_timestamp: str,
+                        ack_id: str = "") -> dict[str, Any]:
         body = {
             "systemId": config.UPI_SYSTEM_ID,
             "payload": {
@@ -194,6 +195,7 @@ class GatewayClient:
                 "accNo":   account_number,
                 "amount":  _as_number(amount),
                 "crtDate": _to_upi_date(transaction_timestamp),
+                "ackId":   ack_id,
             },
         }
         return self._request("POST", "/api/v1/upi/secure", json_body=body)

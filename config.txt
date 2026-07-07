@@ -149,6 +149,9 @@ BQ_FIELD_REF          = _env("BQ_FIELD_REF", "LPUTRN")     # UTR/RRN column read
 # real UTR); OGTRNO holds an unrelated internal ref. Kept separate from
 # BQ_FIELD_REF so a stale env can't misroute the search.
 BQ_SEARCH_REF_FIELD   = _env("BQ_SEARCH_REF_FIELD", "LPUTRN")
+# NEFT/RTGS UTRs (HSBCN*/HSBCR*) are exactly this many chars. Shorter HSBCN*/
+# HSBCR* tokens in the same narrative are internal refs, not the UTR.
+UTR_LENGTH            = _env_int("UTR_LENGTH", 22)
 BQ_FIELD_AMOUNT       = _env("BQ_FIELD_AMOUNT", "OGPYAM")
 BQ_FIELD_DATE         = _env("BQ_FIELD_DATE", "OGCPDT")
 BQ_FIELD_TIME         = _env("BQ_FIELD_TIME", "OGCPTM")
@@ -184,6 +187,9 @@ CBDOC_FILTER_BY_DATE = _env("CBDOC_FILTER_BY_DATE", "false").lower() == "true"
 # MAX_CBDOC_DEFERS times, then mark NEEDS_REVIEW.
 CBDOC_BUFFER_HOURS = _env_int("CBDOC_BUFFER_HOURS", 28)
 MAX_CBDOC_DEFERS   = _env_int("MAX_CBDOC_DEFERS", 3)
+# Recent (<24h) credit cases whose NEFT/RTGS bene isn't in CBDOC yet (CBDOC is
+# T+1) are retried the next morning at this hour, IST. UPI has no such wait.
+CBDOC_RETRY_HOUR_IST = _env_int("CBDOC_RETRY_HOUR_IST", 10)
 
 # Credit reconciliation now sources DEBITS from the live DD transaction enquiry
 # (available immediately), so recent frauds no longer need to wait for CBDOC T+1.
