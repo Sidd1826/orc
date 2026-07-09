@@ -1,0 +1,248 @@
+-- =============================================================================
+-- schema.sql — FULL standalone schema for the MHA fraud-recovery database.
+--
+-- Builds a fresh production database from scratch:
+--   1. ENUM types
+--   2. Shared tables  (complaints, instruments, incidents, api_response_logs)
+--      — created/written by the MHA ingest service; the orchestrator READS
+--        complaints/instruments/incidents and WRITES api_response_logs.
+--   3. Orchestrator-owned tables (complaint_processing, processing_steps)
+--      — owned ENTIRELY by this orchestrator service.
+--
+-- Idempotent: safe to run repeatedly (IF NOT EXISTS / guarded enum creation).
+--
+-- Run:
+--   psql "postgresql://USER:PASS@HOST:5432/DB" -f schema.sql
+--
+-- NOTE: If the MHA ingest service already owns the shared tables in prod, run
+-- only Sections 1 & 3 there and skip Section 2 (or let IF NOT EXISTS no-op it).
+-- =============================================================================
+
+BEGIN;
+
+-- =============================================================================
+-- SECTION 1 — ENUM TYPES
+-- Guarded so re-runs don't error (CREATE TYPE has no IF NOT EXISTS).
+-- =============================================================================
+
+DO $$ BEGIN
+    CREATE TYPE payment_mode AS ENUM ('Credit', 'Debit', 'UPI', 'NEFT', 'RTGS', 'IMPS');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE transaction_type AS ENUM ('P2P', 'P2M', 'Collect', 'Refund', 'Unknown');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE fraud_sub_category AS ENUM (
+        'UPI Related Frauds', 'Card Fraud', 'Net Banking Fraud', 'Wallet Fraud', 'Other'
+    );
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE api_response_status AS ENUM ('SUCCESS', 'FAILURE', 'PENDING', 'TIMEOUT');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+
+-- =============================================================================
+-- SECTION 2 — SHARED TABLES (MHA ingest service)
+-- The orchestrator treats complaints/instruments/incidents as READ-ONLY and
+-- writes only api_response_logs.
+-- =============================================================================
+
+-- ---- complaints -------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS complaints (
+    id                  BIGSERIAL PRIMARY KEY,
+    acknowledgement_no  VARCHAR(20)         NOT NULL UNIQUE,
+    sub_category        fraud_sub_category  NOT NULL,
+    status              VARCHAR(20)         NOT NULL DEFAULT 'OPEN',
+                                            -- OPEN | IN_PROGRESS | RESOLVED | CLOSED
+    created_at          TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ         NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_complaints_ack_no     ON complaints(acknowledgement_no);
+CREATE INDEX IF NOT EXISTS idx_complaints_status     ON complaints(status);
+CREATE INDEX IF NOT EXISTS idx_complaints_created_at ON complaints(created_at);
+
+
+-- ---- instruments ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS instruments (
+    id                   BIGSERIAL PRIMARY KEY,
+    complaint_id         BIGINT           NOT NULL REFERENCES complaints(id) ON DELETE CASCADE,
+
+    requestor            VARCHAR(50)      NOT NULL,          -- e.g. I4C-MHA
+    payer_bank           VARCHAR(100)     NOT NULL,
+    payer_bank_code      VARCHAR(10)      NOT NULL,
+
+    mode_of_payment      payment_mode     NOT NULL,
+    transaction_type     transaction_type NOT NULL DEFAULT 'Unknown',
+    wallet               VARCHAR(50),                        -- PhonePe, Paytm, etc.
+
+    payer_mobile_number  VARCHAR(15)      NOT NULL,
+    payer_account_number VARCHAR(30)      NOT NULL,
+
+    state                VARCHAR(60),
+    district             VARCHAR(60),
+
+    created_at           TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_instrument_per_complaint UNIQUE (complaint_id)
+    -- One instrument per complaint; drop this constraint if 1:N is ever needed.
+);
+
+CREATE INDEX IF NOT EXISTS idx_instruments_complaint_id  ON instruments(complaint_id);
+CREATE INDEX IF NOT EXISTS idx_instruments_payer_mobile  ON instruments(payer_mobile_number);
+CREATE INDEX IF NOT EXISTS idx_instruments_payer_account ON instruments(payer_account_number);
+CREATE INDEX IF NOT EXISTS idx_instruments_bank_code     ON instruments(payer_bank_code);
+
+
+-- ---- incidents (individual transactions) ------------------------------------
+CREATE TABLE IF NOT EXISTS incidents (
+    id                  BIGSERIAL PRIMARY KEY,
+    instrument_id       BIGINT          NOT NULL REFERENCES instruments(id) ON DELETE CASCADE,
+
+    merchant_id         VARCHAR(30)     NOT NULL,            -- MHA "rrn"/"m" == RRN/UTR
+    amount              NUMERIC(12, 2)  NOT NULL CHECK (amount > 0),
+    disputed_amount     NUMERIC(12, 2)  NOT NULL CHECK (disputed_amount >= 0),
+    layer               SMALLINT        NOT NULL DEFAULT 0,  -- 0 = direct, 1+ = layered
+
+    transaction_date    DATE            NOT NULL,
+    transaction_time    TIME            NOT NULL,
+    transaction_at      TIMESTAMPTZ     GENERATED ALWAYS AS (
+                            (transaction_date + transaction_time) AT TIME ZONE 'Asia/Kolkata'
+                        ) STORED,        -- combined + IST-normalized for querying
+
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_instrument_id  ON incidents(instrument_id);
+CREATE INDEX IF NOT EXISTS idx_incidents_merchant_id    ON incidents(merchant_id);
+CREATE INDEX IF NOT EXISTS idx_incidents_transaction_at ON incidents(transaction_at);
+CREATE INDEX IF NOT EXISTS idx_incidents_layer          ON incidents(layer);
+
+
+-- ---- api_response_logs (final response sent back to MHA — one row per job) ---
+CREATE TABLE IF NOT EXISTS api_response_logs (
+    id                  BIGSERIAL PRIMARY KEY,
+
+    complaint_id        BIGINT          REFERENCES complaints(id) ON DELETE SET NULL,
+    acknowledgement_no  VARCHAR(20)     NOT NULL,   -- denormalized for fast lookup
+
+    job_id              VARCHAR(60)     NOT NULL UNIQUE,
+                        -- e.g. BANKS-31872168-c5e4-4c3f-9baf-66839fe42354
+
+    response_code       VARCHAR(10)     NOT NULL,   -- "00" = success, store as-is
+    response_message    api_response_status NOT NULL DEFAULT 'SUCCESS',
+    response_payload    JSONB,                       -- full collated response
+    is_success          BOOLEAN         GENERATED ALWAYS AS (
+                            response_code = '00'
+                        ) STORED,
+
+    requested_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    responded_at        TIMESTAMPTZ,                 -- set when async response arrives
+    response_latency_ms INT             GENERATED ALWAYS AS (
+                            EXTRACT(MILLISECONDS FROM (responded_at - requested_at))::INT
+                        ) STORED,
+
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_logs_job_id        ON api_response_logs(job_id);
+CREATE INDEX IF NOT EXISTS idx_api_logs_ack_no        ON api_response_logs(acknowledgement_no);
+CREATE INDEX IF NOT EXISTS idx_api_logs_complaint_id  ON api_response_logs(complaint_id);
+CREATE INDEX IF NOT EXISTS idx_api_logs_response_code ON api_response_logs(response_code);
+CREATE INDEX IF NOT EXISTS idx_api_logs_is_success    ON api_response_logs(is_success);
+CREATE INDEX IF NOT EXISTS idx_api_logs_requested_at  ON api_response_logs(requested_at);
+
+
+-- =============================================================================
+-- SECTION 3 — ORCHESTRATOR-OWNED TABLES
+-- Owned entirely by THIS service. Keeps all processing state out of the shared
+-- tables so the ingest service's schema is untouched.
+-- =============================================================================
+
+-- ---- complaint_processing (sidecar state, 1 row per complaint) --------------
+CREATE TABLE IF NOT EXISTS complaint_processing (
+    id                  BIGSERIAL PRIMARY KEY,
+    complaint_id        BIGINT      NOT NULL UNIQUE
+                                    REFERENCES complaints(id) ON DELETE CASCADE,
+    acknowledgement_no  VARCHAR(20) NOT NULL,                 -- denormalized
+
+    processing_state    VARCHAR(30) NOT NULL DEFAULT 'RECEIVED',
+                        -- RECEIVED | CLASSIFIED | ENRICHED | BALANCE_CHECKED |
+                        -- HOLD_APPLIED | AWAITING_CBDOC | RECONCILING |
+                        -- RESOLVED | NEEDS_REVIEW
+    job_id              VARCHAR(60),
+    attempt_count       INT         NOT NULL DEFAULT 0,
+    lease_expires_at    TIMESTAMPTZ,                          -- claim lease (SKIP LOCKED)
+    next_attempt_at     TIMESTAMPTZ,                          -- wake time (CBDOC 10am retry)
+    defer_count         INT         NOT NULL DEFAULT 0,       -- CBDOC re-defer counter
+    last_error          TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Poller hot path: non-terminal, lease-free, ready (next_attempt_at) rows.
+CREATE INDEX IF NOT EXISTS idx_cp_poll
+    ON complaint_processing (processing_state, lease_expires_at, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_cp_ack ON complaint_processing(acknowledgement_no);
+
+
+-- ---- processing_steps (per-external-call audit + idempotency) ---------------
+CREATE TABLE IF NOT EXISTS processing_steps (
+    id                  BIGSERIAL PRIMARY KEY,
+    complaint_id        BIGINT      REFERENCES complaints(id) ON DELETE CASCADE,
+    acknowledgement_no  VARCHAR(20) NOT NULL,
+    job_id              VARCHAR(60),
+    step                VARCHAR(40) NOT NULL,
+                        -- TXN_ENQUIRY | DD_TXN | DD_ENQUIRY | HOLD | BQ_TRACE |
+                        -- UPI_BENE | CBDOC_BENE | MHA_RESPONSE | STASH_*
+    idempotency_key     VARCHAR(200) UNIQUE,                  -- the double-hold guard
+    status              VARCHAR(20) NOT NULL DEFAULT 'PENDING',  -- PENDING | SUCCESS | FAILURE
+    request_payload     JSONB,
+    response_payload    JSONB,
+    attempt             INT         NOT NULL DEFAULT 1,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_steps_complaint ON processing_steps(complaint_id);
+CREATE INDEX IF NOT EXISTS idx_steps_ack       ON processing_steps(acknowledgement_no);
+CREATE INDEX IF NOT EXISTS idx_steps_step      ON processing_steps(step);
+
+
+-- =============================================================================
+-- SECTION 4 — updated_at auto-touch trigger (optional but recommended)
+-- Keeps updated_at current on every UPDATE across all tables.
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY[
+        'complaints', 'instruments', 'incidents', 'api_response_logs',
+        'complaint_processing', 'processing_steps'
+    ] LOOP
+        EXECUTE format('DROP TRIGGER IF EXISTS trg_%1$s_updated_at ON %1$s;', t);
+        EXECUTE format(
+            'CREATE TRIGGER trg_%1$s_updated_at BEFORE UPDATE ON %1$s '
+            'FOR EACH ROW EXECUTE FUNCTION set_updated_at();', t);
+    END LOOP;
+END $$;
+
+COMMIT;
+
+-- =============================================================================
+-- End of schema.sql
+-- =============================================================================
