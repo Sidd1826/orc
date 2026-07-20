@@ -4,10 +4,12 @@ from fastapi import Request
 async def mha_response(request: Request):
     req_id = str(uuid.uuid4())
     raw_body = (await request.body()).decode("utf-8")   # the bare base64 string
+
     log.info("[%s] headers=%s", req_id, dict(request.headers))
     log.info("[%s] body(len)=%d", req_id, len(raw_body))
 
     http: httpx.AsyncClient = request.app.state.http
+
     try:
         resp = await http.post(
             config.MHA_RESPONSE_URL,
@@ -15,21 +17,53 @@ async def mha_response(request: Request):
             headers={"Content-Type": "text/plain"},
             timeout=config.MHA_RESPONSE_TIMEOUT,
         )
+
+        # Log upstream response
+        log.info("[%s] Upstream Status Code: %s", req_id, resp.status_code)
+        log.info("[%s] Upstream Response Headers: %s", req_id, dict(resp.headers))
+        log.info("[%s] Upstream Response Body: %s", req_id, resp.text)
+
     except httpx.HTTPError as e:
-        raise HTTPException(502, detail=_hsbc_error_detail(
-            req_id=req_id, message=f"Upstream network error: {type(e).__name__}"))
+        log.exception("[%s] Upstream network error", req_id)
+        raise HTTPException(
+            502,
+            detail=_hsbc_error_detail(
+                req_id=req_id,
+                message=f"Upstream network error: {type(e).__name__}"
+            )
+        )
 
     if not (200 <= resp.status_code < 300):
         try:
             upstream_body = resp.json()
         except Exception:
             upstream_body = resp.text
-        raise HTTPException(502, detail=_hsbc_error_detail(
-            req_id=req_id, message=f"Upstream returned HTTP {resp.status_code}",
-            upstream_status=resp.status_code, upstream_body=upstream_body))
+
+        log.error(
+            "[%s] Upstream returned HTTP %s. Body: %s",
+            req_id,
+            resp.status_code,
+            upstream_body,
+        )
+
+        raise HTTPException(
+            502,
+            detail=_hsbc_error_detail(
+                req_id=req_id,
+                message=f"Upstream returned HTTP {resp.status_code}",
+                upstream_status=resp.status_code,
+                upstream_body=upstream_body,
+            ),
+        )
 
     try:
         data = resp.json()
     except Exception:
         data = {"raw": resp.text}
-    return {"requestId": req_id, "data": data}
+
+    log.info("[%s] Returning response: %s", req_id, data)
+
+    return {
+        "requestId": req_id,
+        "data": data,
+    }
