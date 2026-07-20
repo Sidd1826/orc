@@ -101,7 +101,8 @@ class GatewayClient:
     # ------------------------------------------------------------------
     def _request(self, method: str, path: str, *,
                  params: Optional[dict] = None,
-                 json_body: Optional[Any] = None) -> dict[str, Any]:
+                 json_body: Optional[Any] = None,
+                 text_body: Optional[str] = None) -> dict[str, Any]:
         headers = {"Accept": "application/json"}
         tok = _oidc_token()
         if tok:
@@ -109,7 +110,14 @@ class GatewayClient:
 
         log.info("GW -> %s %s params=%s", method, path, list((params or {}).keys()))
         try:
-            resp = self._http.request(method, path, params=params, json=json_body, headers=headers)
+            if text_body is not None:
+                # Raw string body (no JSON encoding, no field wrapper).
+                headers["Content-Type"] = "text/plain"
+                resp = self._http.request(method, path, params=params,
+                                          content=text_body.encode("utf-8"), headers=headers)
+            else:
+                resp = self._http.request(method, path, params=params,
+                                          json=json_body, headers=headers)
         except httpx.HTTPError as e:
             raise GatewayError(f"Gateway network error: {type(e).__name__}: {e}") from e
 
@@ -212,5 +220,7 @@ class GatewayClient:
     # Send the encrypted final response to MHA (via the gateway).
     # `encrypted` is {"iv": "...", "encrypted_data": "..."}.
     # ------------------------------------------------------------------
-    def mha_response(self, encrypted: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", config.MHA_RESPONSE_PATH, json_body=encrypted)
+    def mha_response(self, encrypted: str) -> dict[str, Any]:
+        # `encrypted` is a single base64 string: base64(iv + ciphertext).
+        # Sent as the RAW request body — no JSON, no field wrapper.
+        return self._request("POST", config.MHA_RESPONSE_PATH, text_body=encrypted)

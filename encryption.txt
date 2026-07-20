@@ -4,8 +4,10 @@ encryption.py — AES-256-CBC encryption for the final MHA response payload.
 The key is a base64-encoded 32-byte value provided via config (Secret Manager on
 Cloud Run). NEVER hard-code the key here.
 
-Output shape (what the gateway's mha-response endpoint expects):
-    {"iv": "<base64>", "encrypted_data": "<base64>"}
+Output format (what MHA expects):
+    base64( iv[16 bytes] + ciphertext )   -> a single string.
+The 16-byte IV is prepended to the ciphertext, then the whole thing is
+base64-encoded. The receiver splits the first 16 bytes back off as the IV.
 """
 from __future__ import annotations
 
@@ -41,16 +43,17 @@ def _key() -> bytes:
     return key
 
 
-def encrypt_payload(payload: dict[str, Any]) -> dict[str, str]:
-    """AES-256-CBC encrypt a JSON payload. Returns {iv, encrypted_data} (base64)."""
+def encrypt_payload(payload: dict[str, Any]) -> str:
+    """AES-256-CBC encrypt a JSON payload.
+
+    Returns a single base64 string of (iv + ciphertext): the random 16-byte IV
+    is prepended to the ciphertext before base64-encoding.
+    """
     plain = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     iv = os.urandom(IV_SIZE)
     cipher = AES.new(_key(), AES.MODE_CBC, iv)
-    ct = cipher.encrypt(pad(plain.encode("utf-8"), AES.block_size))
-    return {
-        "iv": base64.b64encode(iv).decode("utf-8"),
-        "encrypted_data": base64.b64encode(ct).decode("utf-8"),
-    }
+    ciphertext = cipher.encrypt(pad(plain.encode("utf-8"), AES.block_size))
+    return base64.b64encode(iv + ciphertext).decode("utf-8")
 
 
 def is_enabled() -> bool:

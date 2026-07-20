@@ -202,3 +202,6 @@ CBDOC_DEFER_RECENT = _env("CBDOC_DEFER_RECENT", "false").lower() == "true"
 MHA_RESPONSE_KEY_B64 = _env("MHA_RESPONSE_KEY_B64", "")
 # Gateway endpoint that forwards the encrypted response to MHA.
 MHA_RESPONSE_PATH = _env("MHA_RESPONSE_PATH", "/api/v1/mha-response")
+# JSON field name that carries the base64(iv+ciphertext) string in the request
+# body to the MHA-response endpoint. Set to match what MHA/the gateway expects.
+MHA_RESPONSE_FIELD = _env("MHA_RESPONSE_FIELD", "data")
