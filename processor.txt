@@ -748,19 +748,16 @@ def _finalize_miscellaneous(s: Session, p: ComplaintProcessing,
     """RRN didn't validate in DD enquiry → send a 'miscellaneous' response to MHA,
     no hold, one object per incident."""
     root = _root_ctx(s, p)
-    txns = [{
-        "rrn_transaction_id": inc.merchant_id,
-        "amount": str(inc.amount),
-        "disputed_amount": str(inc.disputed_amount),
-        "transaction_datetime": f"{inc.transaction_date} {inc.transaction_time}",
-        "txn_type": "Miscellaneous",
-        "txn_type_id": "0",
-        "status_code": "01",            # non-success: RRN not validated
-        "remarks": reason,
-        "root_account_number": root["root_account_number"],
-        "root_rrn_transaction_id": root["root_rrn_transaction_id"],
-        "root_bankid": root["root_bankid"],
-    } for inc in incidents]
+    txns = [_mha_failure(
+        account=root["root_account_number"],
+        rrn=inc.merchant_id,
+        bankid=root["root_bankid"],
+        amount=str(inc.amount),
+        txn_datetime=f"{inc.transaction_date} {inc.transaction_time}",
+        disputed=str(inc.disputed_amount),
+        status_code=MHA_RECORD_NOT_FOUND,     # 01 — record not found
+        remarks=reason,
+    ) for inc in incidents]
     _write_response_log(s, p, {
         "acknowledgement_no": p.acknowledgement_no,
         "job_id": p.job_id,
@@ -1047,36 +1044,128 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
     return bene, rtype, "resolved"
 
 
+# ===========================================================================
+# MHA response object builders.
+#
+# MHA REJECTS the request if any unexpected field is present, so these three
+# builders are the ONLY place response objects may be constructed, and each
+# emits EXACTLY the fields in the MHA contract — no more, no less.
+#
+# Contract rules applied here:
+#   - ifsc_code / root_ifsc_code       -> "NA" (we have no IFSC source)
+#   - Money Transfer To: the root_* fields MIRROR their payee_* counterparts
+#     (root_account_number = payee_account_number, root_rrn_transaction_id =
+#      rrn_transaction_id, root_bankid = payee_bank_code), per MHA's own
+#     Layer >= 1 success example.
+#   - Put on Hold: transaction_datetime = the time the hold was placed.
+# ===========================================================================
+
+MHA_IFSC = "NA"
+
+# MHA Ack response codes.
+MHA_OK               = "00"   # SUCCESS
+MHA_RECORD_NOT_FOUND = "01"   # Record not found
+MHA_INVALID_RRN      = "02"   # Invalid RRN
+
+
+def _mha_money_transfer_to(*, rrn: str, payee_bank: str, payee_bank_code: str,
+                           payee_account: str, amount: str, txn_datetime: str,
+                           disputed: str, effective_balance: str = "",
+                           status_code: str = MHA_OK, remarks: str = "") -> dict:
+    """MHA 'Money Transfer To' (txn_type_id 3) — exact field set."""
+    return {
+        "rrn_transaction_id":      rrn,
+        "payee_bank":              payee_bank,
+        "payee_bank_code":         payee_bank_code,
+        "payee_account_number":    payee_account,
+        "amount":                  amount,
+        "transaction_datetime":    txn_datetime,
+        "disputed_amount":         disputed,
+        "ifsc_code":               MHA_IFSC,
+        "txn_type":                "Money Transfer To",
+        "txn_type_id":             "3",
+        "phone_number":            "",
+        "email":                   "",
+        "pan_number":              "",
+        "root_account_number":     payee_account,      # mirrors payee_account_number
+        "root_rrn_transaction_id": rrn,                # mirrors rrn_transaction_id
+        "root_bankid":             payee_bank_code,    # mirrors payee_bank_code
+        "status_code":             status_code,
+        "remarks":                 remarks,
+        "root_effective_balance":  effective_balance,
+        "root_ifsc_code":          MHA_IFSC,
+    }
+
+
+def _mha_put_on_hold(*, account: str, rrn: str, bankid: str, amount: str,
+                     hold_datetime: str, effective_balance: str = "",
+                     status_code: str = MHA_OK, remarks: str = "") -> dict:
+    """MHA 'Transaction Put on Hold' (txn_type_id 1) — exact field set.
+    The hold is on the ROOT (payer) account, so root_* are the real root values.
+    transaction_datetime is when the hold was placed."""
+    return {
+        "root_account_number":     account,
+        "root_rrn_transaction_id": rrn,
+        "root_bankid":             bankid,
+        "ifsc_code":               MHA_IFSC,
+        "amount":                  amount,
+        "transaction_datetime":    hold_datetime,
+        "phone_number":            "",
+        "email":                   "",
+        "pan_number":              "",
+        "remarks":                 remarks,
+        "txn_type":                "Transaction Put on Hold",
+        "txn_type_id":             "1",
+        "status_code":             status_code,
+        "root_effective_balance":  effective_balance,
+        "root_ifsc_code":          MHA_IFSC,
+    }
+
+
+def _mha_failure(*, account: str, rrn: str, bankid: str, amount: str,
+                 txn_datetime: str, disputed: str,
+                 status_code: str, remarks: str) -> dict:
+    """MHA failure object (status 01 / 02 / ...) — the slim shape from the
+    contract's invalid/failed example. No payee_* / txn_type fields."""
+    return {
+        "root_rrn_transaction_id": rrn,
+        "root_bankid":             bankid,
+        "root_account_number":     account,
+        "amount":                  amount,
+        "transaction_datetime":    txn_datetime,
+        "disputed_amount":         disputed,
+        "remarks":                 remarks,
+        "status_code":             status_code,
+    }
+
+
+# Internal leg state -> (MHA status_code, remarks). An IMPS/unresolved leg is a
+# REAL transfer we simply can't look up, so it is NOT "Invalid RRN" (02); it
+# stays SUCCESS with an explanatory remark for the ops team.
+_LEG_STATUS = {
+    "resolved":      (MHA_OK, ""),
+    "ops_review":    (MHA_OK, "IMPS - beneficiary pending manual lookup"),
+    "cbdoc_pending": (MHA_OK, "Beneficiary details pending"),
+}
+
+
 def _mha_debit_obj(rrn: str, rtype: str, amount: Decimal, txn: dict,
                    bene: dict, root: dict, disputed: Decimal,
                    bene_status: str = "resolved") -> dict:
-    """One MHA 'Money Transfer To' object for a traced debit RRN + its bene.
-    bene_status='ops_review' flags IMPS (or unresolvable) legs for the ops team
-    to fill in the beneficiary manually."""
-    return {
-        "rrn_transaction_id": rrn,
-        "rrn_type": rtype,                       # NEFT / RTGS / UPI / IMPS
-        "bene_status": bene_status,              # 'resolved' | 'ops_review'
-        "payee_bank": bene.get("bank", ""),
-        "payee_bank_code": bene.get("bankCode", ""),
-        "payee_account_number": bene.get("account", ""),
-        "payee_name": bene.get("name", ""),
-        "payee_vpa": bene.get("vpa", ""),
-        "ifsc_code": bene.get("ifsc", ""),
-        "amount": str(amount),
-        "disputed_amount": str(disputed),
-        "transaction_datetime": bene.get("txn_datetime") or _fmt_txn_time(txn),
-        "txn_type": "Money Transfer To",
-        "txn_type_id": "3",
-        "phone_number": "", "email": "", "pan_number": "",
-        "root_account_number": root["root_account_number"],
-        "root_rrn_transaction_id": root["root_rrn_transaction_id"],
-        "root_bankid": root["root_bankid"],
-        "status_code": "02" if bene_status == "ops_review" else "00",
-        "remarks": "IMPS - pending manual bene lookup by ops" if bene_status == "ops_review" else "",
-        "root_effective_balance": root["root_effective_balance"],
-        "root_ifsc_code": root["root_ifsc_code"],
-    }
+    """One traced debit leg -> MHA 'Money Transfer To' object."""
+    code, remarks = _LEG_STATUS.get(bene_status, (MHA_OK, ""))
+    return _mha_money_transfer_to(
+        rrn=rrn,
+        payee_bank=bene.get("bank", ""),
+        payee_bank_code=bene.get("bankCode", ""),
+        payee_account=bene.get("account", ""),
+        amount=str(amount),
+        txn_datetime=bene.get("txn_datetime") or _fmt_txn_time(txn),
+        disputed=str(disputed),
+        effective_balance=root["root_effective_balance"],
+        status_code=code,
+        remarks=remarks,
+    )
 
 
 def _min_incident_utc(incidents: list[Incident]) -> datetime:
@@ -1450,30 +1539,17 @@ def _to_mha_txn(row: dict, root: dict, disputed: Decimal,
     If UPI bene details were fetched (IB Debit >24h UPI path), they fill in
     payee_bank / payee_account_number / ifsc_code."""
     bene = bene or {}
-    return {
-        "rrn_transaction_id": row.get(config.BQ_FIELD_REF, ""),
-        "payee_bank": bene.get("bank") or row.get("OGBEA1", ""),
-        "payee_bank_code": bene.get("bankCode", ""),
-        "payee_account_number": bene.get("account") or _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
-        "payee_name": bene.get("name", ""),
-        "payee_vpa": bene.get("vpa", ""),
-        "amount": str(row.get(config.BQ_FIELD_AMOUNT, "")),
-        "transaction_datetime": _fmt_row_dt(row),
-        "disputed_amount": str(disputed),
-        "ifsc_code": bene.get("ifsc", ""),
-        "txn_type": "Money Transfer To",
-        "txn_type_id": "3",
-        "phone_number": "",
-        "email": "",
-        "pan_number": "",
-        "root_account_number": root["root_account_number"],
-        "root_rrn_transaction_id": root["root_rrn_transaction_id"],
-        "root_bankid": root["root_bankid"],
-        "status_code": "00",
-        "remarks": row.get("OGNAR1", "") or "",
-        "root_effective_balance": root["root_effective_balance"],
-        "root_ifsc_code": root["root_ifsc_code"],
-    }
+    return _mha_money_transfer_to(
+        rrn=row.get(config.BQ_FIELD_REF, ""),
+        payee_bank=bene.get("bank", ""),
+        payee_bank_code=bene.get("bankCode", ""),
+        payee_account=bene.get("account") or _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
+        amount=str(row.get(config.BQ_FIELD_AMOUNT, "")),
+        txn_datetime=_fmt_row_dt(row),
+        disputed=str(disputed),
+        effective_balance=root["root_effective_balance"],
+        remarks=row.get("OGNAR1", "") or "",
+    )
 
 
 def _fmt_dt(d: Any, t: Any) -> Optional[str]:
@@ -1505,24 +1581,24 @@ def _hold_txns(s: Session, p: ComplaintProcessing, root: dict) -> list[dict]:
     out = []
     for r in rows:
         req = r.request_payload or {}
-        out.append({
-            "root_account_number": req.get("account", root["root_account_number"]),
-            "root_rrn_transaction_id": root["root_rrn_transaction_id"],
-            "root_bankid": root["root_bankid"],
-            "ifsc_code": "",
-            "amount": req.get("amount", ""),
-            "transaction_datetime": "",
-            "phone_number": "",
-            "email": "",
-            "pan_number": "",
-            "remarks": "",
-            "txn_type": "Transaction Put on Hold",
-            "txn_type_id": "1",
-            "status_code": "00",
-            "root_effective_balance": root["root_effective_balance"],
-            "root_ifsc_code": root["root_ifsc_code"],
-        })
+        out.append(_mha_put_on_hold(
+            account=req.get("account", root["root_account_number"]),
+            rrn=root["root_rrn_transaction_id"],
+            bankid=root["root_bankid"],
+            amount=req.get("amount", ""),
+            hold_datetime=_fmt_hold_dt(r.created_at),   # when the hold was placed
+            effective_balance=root["root_effective_balance"],
+        ))
     return out
+
+
+def _fmt_hold_dt(dt: Optional[datetime]) -> str:
+    """Format a hold's placement time as 'YYYY-MM-DD HH:MM:SS' in IST."""
+    if not dt:
+        return ""
+    if dt.tzinfo is None:                     # naive -> assume UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_IST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _finalize(s: Session, p: ComplaintProcessing, instrument: Instrument,
@@ -1551,30 +1627,18 @@ def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Inc
             str(row.get(k, "")).strip() for k in ("OGBEA1", "OGBEA2", "OGBEA3", "OGBEA4")
             if str(row.get(k, "")).strip()
         )
-        txns.append({
-            "rrn_transaction_id": inc.merchant_id,
-            "payee_bank": "",
-            "payee_bank_code": "",
-            "payee_account_number": _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
-            "payee_name": name,
-            "amount": str(inc.amount),
-            "transaction_datetime": _fmt_row_dt(row)
-                                    or f"{inc.transaction_date} {inc.transaction_time}",
-            "disputed_amount": str(inc.disputed_amount),
-            "ifsc_code": str(row.get(config.BQ_FIELD_IFSC, "") or "").strip(),
-            "txn_type": "Money Transfer To",
-            "txn_type_id": "3",
-            "phone_number": "",
-            "email": "",
-            "pan_number": "",
-            "root_account_number": root["root_account_number"],
-            "root_rrn_transaction_id": root["root_rrn_transaction_id"],
-            "root_bankid": root["root_bankid"],
-            "status_code": "00",
-            "remarks": row.get("OGNAR1", "") or "",
-            "root_effective_balance": root["root_effective_balance"],
-            "root_ifsc_code": root["root_ifsc_code"],
-        })
+        txns.append(_mha_money_transfer_to(
+            rrn=inc.merchant_id,
+            payee_bank=name,                 # CBDOC OGBEA1-4 = beneficiary name
+            payee_bank_code="",
+            payee_account=_strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
+            amount=str(inc.amount),
+            txn_datetime=_fmt_row_dt(row)
+                         or f"{inc.transaction_date} {inc.transaction_time}",
+            disputed=str(inc.disputed_amount),
+            effective_balance=root["root_effective_balance"],
+            remarks=row.get("OGNAR1", "") or "",
+        ))
     _write_response_log(s, p, {
         "acknowledgement_no": p.acknowledgement_no,
         "job_id": p.job_id,
@@ -1592,30 +1656,16 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
         step = _step_get(s, p, "UPI_BENE", f"UPI:{p.acknowledgement_no}:{inc.merchant_id}")
         raw = _dig(step.response_payload, "data") if step and step.response_payload else {}
         bene = _normalise_bene(raw or {})
-        txns.append({
-            "rrn_transaction_id": inc.merchant_id,
-            "payee_bank": bene.get("bank", ""),
-            "payee_bank_code": bene.get("bankCode", ""),
-            "payee_account_number": bene.get("account", ""),
-            "payee_name": bene.get("name", ""),
-            "payee_vpa": bene.get("vpa", ""),
-            "amount": str(inc.amount),
-            "transaction_datetime": f"{inc.transaction_date} {inc.transaction_time}",
-            "disputed_amount": str(inc.disputed_amount),
-            "ifsc_code": bene.get("ifsc", ""),
-            "txn_type": "Money Transfer To",
-            "txn_type_id": "3",
-            "phone_number": "",
-            "email": "",
-            "pan_number": "",
-            "root_account_number": root["root_account_number"],
-            "root_rrn_transaction_id": root["root_rrn_transaction_id"],
-            "root_bankid": root["root_bankid"],
-            "status_code": "00",
-            "remarks": "",
-            "root_effective_balance": root["root_effective_balance"],
-            "root_ifsc_code": root["root_ifsc_code"],
-        })
+        txns.append(_mha_money_transfer_to(
+            rrn=inc.merchant_id,
+            payee_bank=bene.get("bank", ""),
+            payee_bank_code=bene.get("bankCode", ""),
+            payee_account=bene.get("account", ""),
+            amount=str(inc.amount),
+            txn_datetime=f"{inc.transaction_date} {inc.transaction_time}",
+            disputed=str(inc.disputed_amount),
+            effective_balance=root["root_effective_balance"],
+        ))
     _write_response_log(s, p, {
         "acknowledgement_no": p.acknowledgement_no,
         "job_id": p.job_id,
@@ -1682,3 +1732,4 @@ def _send_mha_response(s: Session, p: ComplaintProcessing, payload: dict) -> Non
         _step_record(s, p, "MHA_RESPONSE", idem,
                      {"acknowledgement_no": p.acknowledgement_no},
                      {"error": str(e)}, status="FAILURE")
+
