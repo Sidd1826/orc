@@ -998,7 +998,7 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
                 _step_record(s, p, "UPI_BENE", idem, {"rrn": rrn},
                              {"invalid": True, "error": str(e)}, status="FAILURE")
                 return {}, "IMPS", "ops_review"
-        data = _dig(step.response_payload, "data") or {}
+        data = _dig(step.response_payload, "data") or step.response_payload or {}
         if not data or (step.response_payload or {}).get("invalid"):
             # cached invalid, or empty payload -> IMPS/ops
             return {}, "IMPS", "ops_review"
@@ -1070,14 +1070,22 @@ MHA_INVALID_RRN      = "02"   # Invalid RRN
 
 def _mha_money_transfer_to(*, rrn: str, payee_bank: str, payee_bank_code: str,
                            payee_account: str, amount: str, txn_datetime: str,
-                           disputed: str, effective_balance: str = "",
+                           disputed: str, root_account: str,
+                           effective_balance: str = "",
                            status_code: str = MHA_OK, remarks: str = "") -> dict:
-    """MHA 'Money Transfer To' (txn_type_id 3) — exact field set."""
+    """MHA 'Money Transfer To' (txn_type_id 3) — exact field set.
+
+    Account mapping (they are NOT the same account):
+      root_account_number  = the PAYER/root account — what we send as `accNo`
+                             in the UPI request (the victim's account).
+      payee_account_number = the BENEFICIARY account — `pyAccNo` from the UPI
+                             API response (where the money went).
+    """
     return {
         "rrn_transaction_id":      rrn,
         "payee_bank":              payee_bank,
         "payee_bank_code":         payee_bank_code,
-        "payee_account_number":    payee_account,
+        "payee_account_number":    payee_account,      # <- pyAccNo (response)
         "amount":                  amount,
         "transaction_datetime":    txn_datetime,
         "disputed_amount":         disputed,
@@ -1087,7 +1095,7 @@ def _mha_money_transfer_to(*, rrn: str, payee_bank: str, payee_bank_code: str,
         "phone_number":            "",
         "email":                   "",
         "pan_number":              "",
-        "root_account_number":     payee_account,      # mirrors payee_account_number
+        "root_account_number":     root_account,       # <- accNo (request)
         "root_rrn_transaction_id": rrn,                # mirrors rrn_transaction_id
         "root_bankid":             payee_bank_code,    # mirrors payee_bank_code
         "status_code":             status_code,
@@ -1162,6 +1170,7 @@ def _mha_debit_obj(rrn: str, rtype: str, amount: Decimal, txn: dict,
         amount=str(amount),
         txn_datetime=bene.get("txn_datetime") or _fmt_txn_time(txn),
         disputed=str(disputed),
+        root_account=root["root_account_number"],
         effective_balance=root["root_effective_balance"],
         status_code=code,
         remarks=remarks,
@@ -1504,32 +1513,69 @@ def _root_ctx(s: Session, p: ComplaintProcessing) -> dict:
 # Fields we don't yet have a source for are emitted as "" so the JSON shape is
 # complete. Wire them up once you confirm where they come from (transaction
 # enquiry narratives, a customer-info service, or extra CBDOC columns).
+def _find_key(obj: Any, key: str) -> Any:
+    """Recursively find the first occurrence of `key` anywhere in a nested
+    dict/list structure. Returns None if absent. Used because the decrypted UPI
+    payload nesting varies between HSBC environments."""
+    if isinstance(obj, dict):
+        if key in obj and obj[key] not in (None, ""):
+            return obj[key]
+        for v in obj.values():
+            found = _find_key(v, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_key(item, key)
+            if found is not None:
+                return found
+    return None
+
+
 def _normalise_bene(data: dict) -> dict:
-    """Map the real UPI API response (data.*) to a canonical bene dict.
-    Real UPI response keys:
-      pyAccNo     -> beneficiary account
+    """Map the real UPI API response to a canonical bene dict.
+
+    UPI response keys (the BENEFICIARY — where the money went):
+      pyAccNo     -> beneficiary account  == MHA payee_account_number
       pyIfscCode  -> beneficiary IFSC
       bankName    -> beneficiary bank (short name)
       bankCode    -> beneficiary bank code
       pyFname     -> beneficiary name
       pyFvaddr    -> beneficiary VPA
+
+    NOTE: the account we SEND in the request (`accNo`) is the payer/root
+    account and maps to MHA root_account_number — not to payee_account_number.
+
+    Keys are deep-searched so extra nesting in the decrypted payload doesn't
+    silently blank the fields.
     """
     data = data or {}
-    return {
-        "account": data.get("pyAccNo", ""),
-        "ifsc":    data.get("pyIfscCode", ""),
-        "bank":    data.get("bankName", ""),
-        "bankCode": data.get("bankCode", ""),
-        "name":    data.get("pyFname", ""),
-        "vpa":     data.get("pyFvaddr", ""),
+
+    def g(key: str) -> str:
+        v = data.get(key)
+        if v in (None, ""):
+            v = _find_key(data, key)      # fall back to a deep search
+        return str(v) if v not in (None, "") else ""
+
+    bene = {
+        "account":  g("pyAccNo"),          # -> payee_account_number
+        "ifsc":     g("pyIfscCode"),
+        "bank":     g("bankName"),
+        "bankCode": g("bankCode"),
+        "name":     g("pyFname"),
+        "vpa":      g("pyFvaddr"),
     }
+    if not bene["account"]:
+        log.warning("UPI bene: pyAccNo not found. payload keys=%s",
+                    list(data.keys()) if isinstance(data, dict) else type(data).__name__)
+    return bene
 
 
 def _upi_bene_for(s: Session, p: ComplaintProcessing, rrn: str) -> dict:
     """Return normalised UPI bene data for this RRN if it was fetched, else {}."""
     step = _step_get(s, p, "UPI_BENE", f"UPI:{p.acknowledgement_no}:{rrn}")
     if step and step.status == "SUCCESS" and step.response_payload:
-        return _normalise_bene(_dig(step.response_payload, "data") or {})
+        return _normalise_bene(_dig(step.response_payload, "data") or step.response_payload or {})
     return {}
 
 
@@ -1547,6 +1593,7 @@ def _to_mha_txn(row: dict, root: dict, disputed: Decimal,
         amount=str(row.get(config.BQ_FIELD_AMOUNT, "")),
         txn_datetime=_fmt_row_dt(row),
         disputed=str(disputed),
+        root_account=root["root_account_number"],
         effective_balance=root["root_effective_balance"],
         remarks=row.get("OGNAR1", "") or "",
     )
@@ -1636,6 +1683,7 @@ def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Inc
             txn_datetime=_fmt_row_dt(row)
                          or f"{inc.transaction_date} {inc.transaction_time}",
             disputed=str(inc.disputed_amount),
+            root_account=root["root_account_number"],
             effective_balance=root["root_effective_balance"],
             remarks=row.get("OGNAR1", "") or "",
         ))
@@ -1654,7 +1702,7 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
     txns = []
     for inc in incidents:
         step = _step_get(s, p, "UPI_BENE", f"UPI:{p.acknowledgement_no}:{inc.merchant_id}")
-        raw = _dig(step.response_payload, "data") if step and step.response_payload else {}
+        raw = (_dig(step.response_payload, "data") or step.response_payload) if step and step.response_payload else {}
         bene = _normalise_bene(raw or {})
         txns.append(_mha_money_transfer_to(
             rrn=inc.merchant_id,
@@ -1664,6 +1712,7 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
             amount=str(inc.amount),
             txn_datetime=f"{inc.transaction_date} {inc.transaction_time}",
             disputed=str(inc.disputed_amount),
+            root_account=root["root_account_number"],
             effective_balance=root["root_effective_balance"],
         ))
     _write_response_log(s, p, {
