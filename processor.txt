@@ -265,6 +265,19 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
     account = instrument.payer_account_number
     total_disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
 
+    # Only UPI and Internet Banking have implemented flows. Anything else (Card
+    # Fraud, Wallet Fraud, Other, or an unrecognised value) must NOT be forced
+    # through the IB flow — respond 'not processed' and park for manual review.
+    if not cls.is_supported:
+        log.warning("[%s] unsupported channel for sub_category=%r -> NEEDS_REVIEW",
+                    p.acknowledgement_no, c.sub_category)
+        _finalize_miscellaneous(
+            s, p, incidents,
+            f"Unsupported fraud category '{c.sub_category}' - not processed",
+        )
+        _to_review(s, p, f"unsupported sub_category: {c.sub_category}")
+        return
+
     # Advance one step at a time; commit after each so retries resume here.
     guard = 0
     while p.processing_state not in TERMINAL_STATES and guard < 20:
