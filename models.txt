@@ -29,20 +29,19 @@ class Base(DeclarativeBase):
     pass
 
 
-# Native PG enum types (already created in the DB; create_type=False so
-# SQLAlchemy maps to them without trying to CREATE TYPE or cast to VARCHAR).
-PaymentMode = ENUM(
-    "Credit", "Debit", "UPI", "NEFT", "RTGS", "IMPS",
-    name="payment_mode", create_type=False,
+# Input-facing categories come from MHA in varying case and are stored as plain
+# VARCHAR (no enum, no CHECK), so no value or casing can be rejected by the DB.
+# Value handling lives in the application layer. Canonical spellings for
+# reference only — they are NOT enforced:
+PAYMENT_MODES      = ("Credit", "Debit", "UPI", "NEFT", "RTGS", "IMPS")
+TRANSACTION_TYPES  = ("P2P", "P2M", "Collect", "Refund", "Unknown")
+FRAUD_SUB_CATEGORIES = (
+    "UPI Related Frauds", "Card Fraud", "Internet Banking Related Fraud",
+    "Wallet Fraud", "Other",
 )
-TransactionType = ENUM(
-    "P2P", "P2M", "Collect", "Refund", "Unknown",
-    name="transaction_type", create_type=False,
-)
-FraudSubCategory = ENUM(
-    "UPI Related Frauds", "Card Fraud", "Net Banking Fraud", "Wallet Fraud", "Other",
-    name="fraud_sub_category", create_type=False,
-)
+
+# api_response_status is written by THIS service with exact case, so it stays a
+# native (case-sensitive) enum.
 ApiResponseStatus = ENUM(
     "SUCCESS", "FAILURE", "PENDING", "TIMEOUT",
     name="api_response_status", create_type=False,
@@ -76,7 +75,7 @@ class Complaint(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     acknowledgement_no: Mapped[str] = mapped_column(String(20), unique=True)
-    sub_category: Mapped[str] = mapped_column(FraudSubCategory)
+    sub_category: Mapped[str] = mapped_column(String)
     status: Mapped[str] = mapped_column(String(20), default=STATUS_OPEN)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -123,8 +122,8 @@ class Instrument(Base):
     requestor: Mapped[str] = mapped_column(String(50))
     payer_bank: Mapped[str] = mapped_column(String(100))
     payer_bank_code: Mapped[str] = mapped_column(String(10))
-    mode_of_payment: Mapped[str] = mapped_column(PaymentMode)
-    transaction_type: Mapped[str] = mapped_column(TransactionType, default="Unknown")
+    mode_of_payment: Mapped[str] = mapped_column(String)
+    transaction_type: Mapped[Optional[str]] = mapped_column(String, nullable=True, default="Unknown")
     wallet: Mapped[Optional[str]] = mapped_column(String(50))
     payer_mobile_number: Mapped[str] = mapped_column(String(15))
     payer_account_number: Mapped[str] = mapped_column(String(30))
