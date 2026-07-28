@@ -265,17 +265,16 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
     account = instrument.payer_account_number
     total_disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
 
-    # Only UPI and Internet Banking have implemented flows. Anything else (Card
-    # Fraud, Wallet Fraud, Other, or an unrecognised value) must NOT be forced
-    # through the IB flow — respond 'not processed' and park for manual review.
-    if not cls.is_supported:
-        log.warning("[%s] unsupported channel for sub_category=%r -> NEEDS_REVIEW",
-                    p.acknowledgement_no, c.sub_category)
-        _finalize_miscellaneous(
-            s, p, incidents,
-            f"Unsupported fraud category '{c.sub_category}' - not processed",
-        )
-        _to_review(s, p, f"unsupported sub_category: {c.sub_category}")
+    # Channel now comes from the RRN shape. If it matches neither UPI (12-digit)
+    # nor IB (16/22-char), do ONE DD transaction enquiry and return whatever it
+    # has, rather than forcing the complaint down the wrong flow.
+    if cls.needs_dd_probe:
+        log.warning("[%s] RRN shape unknown -> DD-enquiry probe",
+                    p.acknowledgement_no)
+        _finalize_dd_probe(s, p, instrument, incidents)
+        p.processing_state = ST_RESOLVED
+        p.lease_expires_at = None
+        s.add(p); s.commit()
         return
 
     # Advance one step at a time; commit after each so retries resume here.
@@ -1707,6 +1706,57 @@ def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Inc
     })
 
 
+def _finalize_dd_probe(s: Session, p: ComplaintProcessing, instrument: Instrument,
+                       incidents: list[Incident]) -> None:
+    """Fallback for RRNs whose shape matches neither UPI (12-digit) nor IB
+    (16/22-char). Runs ONE DD transaction enquiry; if the RRN is found, returns
+    that transaction's data. Otherwise responds 'record not found'."""
+    account = instrument.payer_account_number
+    from_date = min(i.transaction_date for i in incidents).isoformat()
+    root = _root_ctx(s, p)
+
+    try:
+        resp = _txn_enquiry(s, p, account, from_date)
+    except GatewayError as e:
+        log.error("[%s] DD probe failed: %s", p.acknowledgement_no, e)
+        _finalize_miscellaneous(s, p, incidents, f"DD enquiry failed: {e}")
+        return
+
+    details = _dig(resp, config.TXN_DETAILS_PATH) or _deep_find_txn_list(resp)
+    txns: list[dict] = []
+    for inc in incidents:
+        found = _find_txn_by_rrn(details, inc.merchant_id)
+        if not found:
+            log.info("[%s] DD probe: rrn=%s not found", p.acknowledgement_no, inc.merchant_id)
+            txns.append(_mha_failure(
+                account=root["root_account_number"], rrn=inc.merchant_id,
+                bankid=root["root_bankid"], amount=str(inc.amount),
+                txn_datetime=f"{inc.transaction_date} {inc.transaction_time}",
+                disputed=str(inc.disputed_amount),
+                status_code=MHA_RECORD_NOT_FOUND, remarks="Record not found"))
+            continue
+
+        log.info("[%s] DD probe: rrn=%s FOUND in DD enquiry",
+                 p.acknowledgement_no, inc.merchant_id)
+        amt = abs(_txn_amount(found)) or inc.amount
+        txns.append(_mha_money_transfer_to(
+            rrn=inc.merchant_id,
+            payee_bank="", payee_bank_code="", payee_account="",
+            amount=str(amt),
+            txn_datetime=_fmt_txn_time(found)
+                         or f"{inc.transaction_date} {inc.transaction_time}",
+            disputed=str(inc.disputed_amount),
+            root_account=account,
+            effective_balance=root["root_effective_balance"],
+            remarks="Retrieved from transaction enquiry"))
+
+    _write_response_log(s, p, {
+        "acknowledgement_no": p.acknowledgement_no,
+        "job_id": p.job_id,
+        "transactions": txns,
+    })
+
+
 def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> None:
     """UPI-debit: one 'Money Transfer To' per incident, populated from the UPI
     beneficiary lookup."""
@@ -1794,4 +1844,3 @@ def _send_mha_response(s: Session, p: ComplaintProcessing, payload: dict) -> Non
         _step_record(s, p, "MHA_RESPONSE", idem,
                      {"acknowledgement_no": p.acknowledgement_no},
                      {"error": str(e)}, status="FAILURE")
-

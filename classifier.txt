@@ -23,15 +23,22 @@ log = get_logger(__name__)
 
 CHANNEL_UPI = "UPI"
 CHANNEL_IB  = "INTERNET_BANKING"
-CHANNEL_UNSUPPORTED = "UNSUPPORTED"   # anything we must NOT run a flow for
+CHANNEL_UNKNOWN = "UNKNOWN"   # RRN length matches neither -> DD-enquiry probe
 DIR_DEBIT   = "DEBIT"
 DIR_CREDIT  = "CREDIT"
 
-# Only these two channels have implemented flows. A sub_category that matches
-# neither (Card Fraud, Wallet Fraud, Other, or anything new) is classified
-# UNSUPPORTED and routed to review instead of being forced through the IB flow.
-_UPI_KEYWORDS = ("UPI",)
-_IB_KEYWORDS  = ("INTERNET BANKING", "NET BANKING", "NETBANKING", "INTERNETBANKING")
+# Channel is decided by the RRN/UTR SHAPE, not sub_category — an
+# "Internet Banking Related Fraud" complaint can still carry a UPI RRN.
+#   12 digits      -> UPI
+#   16 or 22 chars -> Internet Banking (NEFT/RTGS UTR)
+#   anything else  -> UNKNOWN: probe DD transaction enquiry and return what it has
+RRN_UPI_LEN = 12
+RRN_IB_LENS = (16, 22)
+
+# Layer semantics (per MHA):
+#   layer 0      -> ALWAYS a debit from the HSBC account (never a credit)
+#   layer 1..10  -> may be debit OR credit; use mode_of_payment
+LAYER_ROOT = 0
 
 
 @dataclass
@@ -40,10 +47,34 @@ class Classification:
     direction: str
     is_recent: bool
     fraud_age_hours: float
+    layer: int = 0
 
     @property
     def is_supported(self) -> bool:
         return self.channel in (CHANNEL_UPI, CHANNEL_IB)
+
+    @property
+    def needs_dd_probe(self) -> bool:
+        return self.channel == CHANNEL_UNKNOWN
+
+
+def channel_for_rrn(rrn: str) -> str:
+    """Classify a single RRN/UTR by shape. See RRN_* constants above."""
+    t = (rrn or "").strip()
+    if not t:
+        return CHANNEL_UNKNOWN
+    if t.isdigit() and len(t) == RRN_UPI_LEN:
+        return CHANNEL_UPI
+    if len(t) in RRN_IB_LENS:
+        return CHANNEL_IB
+    return CHANNEL_UNKNOWN
+
+
+def direction_for_layer(layer: int, mode_of_payment: str) -> str:
+    """Layer 0 is always a debit for HSBC. Layers 1-10 follow mode_of_payment."""
+    if (layer or 0) == LAYER_ROOT:
+        return DIR_DEBIT
+    return DIR_CREDIT if "CREDIT" in (mode_of_payment or "").upper() else DIR_DEBIT
 
 
 def _earliest_txn_at(incidents: list[Incident]) -> datetime:
@@ -52,24 +83,27 @@ def _earliest_txn_at(incidents: list[Incident]) -> datetime:
 
 
 def classify(instrument: Instrument, incidents: list[Incident],
-             sub_category: str) -> Classification:
-    sub = (sub_category or "").upper()
-    mode = (instrument.mode_of_payment or "").upper()
+             sub_category: str = "") -> Classification:
+    """Route a complaint. sub_category is NO LONGER used to pick the channel —
+    an IB-categorised complaint can carry a UPI RRN — so the channel comes from
+    the RRN shape and the direction from the layer."""
+    mode = instrument.mode_of_payment or ""
 
-    # Explicit match — no silent "everything else is IB" fallback.
-    if any(k in sub for k in _UPI_KEYWORDS) or any(k in mode for k in _UPI_KEYWORDS):
-        channel = CHANNEL_UPI
-    elif any(k in sub for k in _IB_KEYWORDS):
-        channel = CHANNEL_IB
-    else:
-        channel = CHANNEL_UNSUPPORTED
-        log.warning(
-            "Unsupported sub_category=%r mode_of_payment=%r -> no flow will be run",
-            sub_category, instrument.mode_of_payment,
-        )
+    # Primary incident = the root (layer 0) if present, else the first.
+    primary = next((i for i in incidents if (i.layer or 0) == LAYER_ROOT),
+                   incidents[0] if incidents else None)
+    layer = (primary.layer or 0) if primary else 0
+    rrn = primary.merchant_id if primary else ""
 
-    # Direction: "Debit" => debited from HSBC account; "Credit" => credited in.
-    direction = DIR_CREDIT if "CREDIT" in mode else DIR_DEBIT
+    channel = channel_for_rrn(rrn)
+    direction = direction_for_layer(layer, mode)
+
+    if channel == CHANNEL_UNKNOWN:
+        log.warning("RRN %r (len=%d) matches no known shape -> DD-enquiry probe",
+                    rrn, len(rrn or ""))
+    if layer == LAYER_ROOT and "CREDIT" in mode.upper():
+        log.warning("layer 0 with mode_of_payment=%r — layer 0 is always DEBIT "
+                    "for HSBC; treating as DEBIT", mode)
 
     txn_at = _earliest_txn_at(incidents)
     if txn_at.tzinfo is None:
@@ -78,7 +112,7 @@ def classify(instrument: Instrument, incidents: list[Incident],
     is_recent = age_hours < config.FRAUD_AGE_THRESHOLD_HOURS
 
     c = Classification(channel=channel, direction=direction,
-                       is_recent=is_recent, fraud_age_hours=age_hours)
-    log.info("classify -> channel=%s direction=%s recent=%s age=%.1fh",
-             c.channel, c.direction, c.is_recent, c.fraud_age_hours)
+                       is_recent=is_recent, fraud_age_hours=age_hours, layer=layer)
+    log.info("classify -> channel=%s direction=%s layer=%d rrn=%s recent=%s age=%.1fh",
+             c.channel, c.direction, c.layer, rrn, c.is_recent, c.fraud_age_hours)
     return c

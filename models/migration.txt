@@ -1,0 +1,98 @@
+-- =============================================================================
+-- migration.sql — ALTER-ONLY upgrade for an EXISTING database.
+--
+-- NO tables are dropped and NO data is lost. Brings a DB created by an earlier
+-- version up to the current schema.
+--
+-- Safe to re-run (IF NOT EXISTS / IF EXISTS guards throughout).
+--
+-- Run:
+--   psql "postgresql://USER:PASS@HOST:5432/DB" -f migration.sql
+--
+-- Recommended: take a backup and pause the orchestrator first.
+--   pg_dump "postgresql://..." > backup_$(date +%F).sql
+-- =============================================================================
+
+BEGIN;
+
+-- -----------------------------------------------------------------------------
+-- 1. Enum -> VARCHAR (accept any case / any value; no DB-level rejection)
+--    Shared tables — coordinate with the MHA ingest service before running.
+-- -----------------------------------------------------------------------------
+
+ALTER TABLE instruments
+    ALTER COLUMN mode_of_payment TYPE VARCHAR
+    USING mode_of_payment::VARCHAR;
+
+ALTER TABLE instruments
+    ALTER COLUMN transaction_type TYPE VARCHAR
+    USING transaction_type::VARCHAR;
+
+ALTER TABLE complaints
+    ALTER COLUMN sub_category TYPE VARCHAR
+    USING sub_category::VARCHAR;
+
+-- transaction_type becomes optional
+ALTER TABLE instruments
+    ALTER COLUMN transaction_type DROP NOT NULL;
+
+-- Drop CHECK constraints if an earlier version added them
+ALTER TABLE complaints  DROP CONSTRAINT IF EXISTS chk_sub_category;
+ALTER TABLE instruments DROP CONSTRAINT IF EXISTS chk_mode;
+ALTER TABLE instruments DROP CONSTRAINT IF EXISTS chk_txntype;
+
+
+-- -----------------------------------------------------------------------------
+-- 2. Orchestrator-owned columns added since the first release
+--    (idempotent — no-ops if already present)
+-- -----------------------------------------------------------------------------
+
+ALTER TABLE complaint_processing
+    ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
+
+ALTER TABLE complaint_processing
+    ADD COLUMN IF NOT EXISTS defer_count     INT NOT NULL DEFAULT 0;
+
+ALTER TABLE complaint_processing
+    ADD COLUMN IF NOT EXISTS last_error      TEXT;
+
+ALTER TABLE processing_steps
+    ADD COLUMN IF NOT EXISTS job_id          VARCHAR(60);
+
+ALTER TABLE processing_steps
+    ADD COLUMN IF NOT EXISTS attempt         INT NOT NULL DEFAULT 1;
+
+
+-- -----------------------------------------------------------------------------
+-- 3. Indexes (idempotent)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_cp_poll
+    ON complaint_processing (processing_state, lease_expires_at,
+                             next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_cp_ack
+    ON complaint_processing (acknowledgement_no);
+CREATE INDEX IF NOT EXISTS idx_steps_complaint ON processing_steps(complaint_id);
+CREATE INDEX IF NOT EXISTS idx_steps_ack       ON processing_steps(acknowledgement_no);
+CREATE INDEX IF NOT EXISTS idx_steps_step      ON processing_steps(step);
+
+COMMIT;
+
+
+-- =============================================================================
+-- 4. OPTIONAL — drop the now-unused enum types.
+--    Run ONLY after BOTH services are deployed with the VARCHAR-based models,
+--    otherwise the other service will error on a missing type.
+-- =============================================================================
+-- DROP TYPE IF EXISTS payment_mode;
+-- DROP TYPE IF EXISTS transaction_type;
+-- DROP TYPE IF EXISTS fraud_sub_category;
+
+
+-- =============================================================================
+-- 5. VERIFY
+-- =============================================================================
+-- \d complaints            -- sub_category      -> character varying
+-- \d instruments           -- mode_of_payment   -> character varying
+--                          -- transaction_type  -> character varying, NULLable
+-- \d complaint_processing  -- next_attempt_at, defer_count present
