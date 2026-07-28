@@ -23,8 +23,15 @@ log = get_logger(__name__)
 
 CHANNEL_UPI = "UPI"
 CHANNEL_IB  = "INTERNET_BANKING"
+CHANNEL_UNSUPPORTED = "UNSUPPORTED"   # anything we must NOT run a flow for
 DIR_DEBIT   = "DEBIT"
 DIR_CREDIT  = "CREDIT"
+
+# Only these two channels have implemented flows. A sub_category that matches
+# neither (Card Fraud, Wallet Fraud, Other, or anything new) is classified
+# UNSUPPORTED and routed to review instead of being forced through the IB flow.
+_UPI_KEYWORDS = ("UPI",)
+_IB_KEYWORDS  = ("INTERNET BANKING", "NET BANKING", "NETBANKING", "INTERNETBANKING")
 
 
 @dataclass
@@ -33,6 +40,10 @@ class Classification:
     direction: str
     is_recent: bool
     fraud_age_hours: float
+
+    @property
+    def is_supported(self) -> bool:
+        return self.channel in (CHANNEL_UPI, CHANNEL_IB)
 
 
 def _earliest_txn_at(incidents: list[Incident]) -> datetime:
@@ -45,7 +56,17 @@ def classify(instrument: Instrument, incidents: list[Incident],
     sub = (sub_category or "").upper()
     mode = (instrument.mode_of_payment or "").upper()
 
-    channel = CHANNEL_UPI if ("UPI" in sub or "UPI" in mode) else CHANNEL_IB
+    # Explicit match — no silent "everything else is IB" fallback.
+    if any(k in sub for k in _UPI_KEYWORDS) or any(k in mode for k in _UPI_KEYWORDS):
+        channel = CHANNEL_UPI
+    elif any(k in sub for k in _IB_KEYWORDS):
+        channel = CHANNEL_IB
+    else:
+        channel = CHANNEL_UNSUPPORTED
+        log.warning(
+            "Unsupported sub_category=%r mode_of_payment=%r -> no flow will be run",
+            sub_category, instrument.mode_of_payment,
+        )
 
     # Direction: "Debit" => debited from HSBC account; "Credit" => credited in.
     direction = DIR_CREDIT if "CREDIT" in mode else DIR_DEBIT
