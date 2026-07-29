@@ -37,7 +37,8 @@ from sqlalchemy.orm import Session
 
 import config
 import encryption
-from classifier import CHANNEL_UPI, DIR_CREDIT, DIR_DEBIT, classify
+from classifier import (CHANNEL_UPI, DIR_CREDIT, DIR_DEBIT, classify,
+                        direction_for_layer)
 from db import session_scope
 from gateway_client import GatewayClient, GatewayError
 from logger import get_logger
@@ -261,9 +262,46 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
         _to_review(s, p, "no instrument/incidents on complaint")
         return
 
-    cls = classify(instrument, incidents, c.sub_category)
+    # ---- Split by amount -------------------------------------------------
+    # Incidents at/below the threshold ALWAYS get "Others Less than equal to
+    # 500" (txn_type_id 17) with no lookup/hold. Incidents above it follow the
+    # normal flow. A complaint may contain both.
+    small     = [i for i in incidents if _is_small(i)]
+    normal    = [i for i in incidents if not _is_small(i)]
+    if small:
+        log.info("[%s] %d incident(s) <= %s -> Others Less than equal to 500; "
+                 "%d follow the normal flow",
+                 p.acknowledgement_no, len(small), config.SMALL_TXN_THRESHOLD,
+                 len(normal))
+        # Stashed here and appended by _write_response_log, so whichever flow
+        # runs for the larger incidents, the small ones ride along in the same
+        # response.
+        _stash_small_txns(s, p, small)
+
+    if not normal:
+        # Everything was small -> respond now, no API calls at all.
+        _finalize_small_only(s, p)
+        p.processing_state = ST_RESOLVED
+        p.lease_expires_at = None
+        s.add(p); s.commit()
+        return
+
+    # Classify on the NORMAL incidents only, so a small layer-0 incident can't
+    # drag the whole complaint's direction/channel.
+    cls = classify(instrument, normal, c.sub_category)
     account = instrument.payer_account_number
-    total_disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
+    total_disputed = sum((i.disputed_amount for i in normal), Decimal("0"))
+
+    # Direction is per-incident (layer 0 = always debit). Warn if the normal
+    # incidents disagree — the flow below runs on the primary direction.
+    dirs = {direction_for_layer(i.layer or 0, instrument.mode_of_payment) for i in normal}
+    if len(dirs) > 1:
+        log.warning("[%s] mixed directions across layers %s -> using %s",
+                    p.acknowledgement_no,
+                    sorted((i.layer or 0) for i in normal), cls.direction)
+
+    # From here on the flow operates on `normal` only.
+    incidents = normal
 
     # Channel now comes from the RRN shape. If it matches neither UPI (12-digit)
     # nor IB (16/22-char), do ONE DD transaction enquiry and return whatever it
@@ -1706,6 +1744,66 @@ def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Inc
     })
 
 
+def _mha_others_le_500(*, account: str, rrn: str, bankid: str, amount: str,
+                       disputed: str, effective_balance: str = "",
+                       status_code: str = MHA_OK, remarks: str = "") -> dict:
+    """MHA 'Others Less than equal to 500' (txn_type_id 17) — exact field set.
+
+    Note this shape differs from the others: NO rrn_transaction_id, NO payee_*
+    fields, NO ifsc_code and NO transaction_datetime. root_ifsc_code IS present.
+    """
+    return {
+        "amount":                  amount,
+        "disputed_amount":         disputed,
+        "txn_type":                "Others Less than equal to 500",
+        "txn_type_id":             "17",
+        "phone_number":            "",
+        "email":                   "",
+        "pan_number":              "",
+        "root_account_number":     account,
+        "root_rrn_transaction_id": rrn,
+        "root_bankid":             bankid,
+        "status_code":             status_code,
+        "remarks":                 remarks,
+        "root_effective_balance":  effective_balance,
+        "root_ifsc_code":          MHA_IFSC,
+    }
+
+
+def _is_small(inc: Incident) -> bool:
+    """True if this incident is at/below the small-transaction threshold."""
+    return (inc.amount or Decimal("0")) <= config.SMALL_TXN_THRESHOLD
+
+
+def _small_txn_objs(s: Session, p: ComplaintProcessing,
+                    incidents: list[Incident]) -> list[dict]:
+    root = _root_ctx(s, p)
+    return [_mha_others_le_500(
+        account=root["root_account_number"],
+        rrn=inc.merchant_id,
+        bankid=root["root_bankid"],
+        amount=str(inc.amount),
+        disputed=str(inc.disputed_amount),
+        effective_balance=root["root_effective_balance"],
+    ) for inc in incidents]
+
+
+def _stash_small_txns(s: Session, p: ComplaintProcessing,
+                      incidents: list[Incident]) -> None:
+    """Record the <=500 objects so _write_response_log appends them to whatever
+    response the larger incidents produce (one response per complaint)."""
+    _stash(s, p, "SMALL_TXNS", {"objs": _small_txn_objs(s, p, incidents)})
+
+
+def _finalize_small_only(s: Session, p: ComplaintProcessing) -> None:
+    """Every incident was <= threshold: respond with just the type-17 objects."""
+    _write_response_log(s, p, {
+        "acknowledgement_no": p.acknowledgement_no,
+        "job_id": p.job_id,
+        "transactions": [],          # small objects appended by _write_response_log
+    })
+
+
 def _finalize_dd_probe(s: Session, p: ComplaintProcessing, instrument: Instrument,
                        incidents: list[Incident]) -> None:
     """Fallback for RRNs whose shape matches neither UPI (12-digit) nor IB
@@ -1788,6 +1886,12 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
 def _write_response_log(s: Session, p: ComplaintProcessing, payload: dict,
                         response_code: str = "00",
                         response_message: str = "SUCCESS") -> None:
+    # Any <=500 incidents ride along in the same response as the larger ones.
+    small = (_unstash(s, p, "SMALL_TXNS") or {}).get("objs") or []
+    if small:
+        payload = dict(payload)
+        payload["transactions"] = list(payload.get("transactions", [])) + small
+
     existing = s.execute(
         select(ApiResponseLog).where(ApiResponseLog.job_id == p.job_id)
     ).scalar_one_or_none()

@@ -7,6 +7,7 @@ Loads from .env locally (python-dotenv); on Cloud Run values come from
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 
 try:
     from dotenv import load_dotenv
@@ -169,6 +170,10 @@ BQ_FIELD_BENE_ACCOUNT = _env("BQ_FIELD_BENE_ACCOUNT", "OGBEAC")
 BQ_FIELD_IFSC         = _env("BQ_FIELD_IFSC", "")
 CBDOC_MAX_ROWS        = _env_int("CBDOC_MAX_ROWS", 500)
 
+# Incidents at or below this amount are reported to MHA as
+# "Others Less than equal to 500" (txn_type_id 17) with no lookup/hold.
+SMALL_TXN_THRESHOLD   = Decimal(_env("SMALL_TXN_THRESHOLD", "500"))
+
 # Optional debit/credit indicator in CBDOC. If your table mixes debits and
 # credits, set BQ_DEBIT_INDICATOR_FIELD to the column and BQ_DEBIT_INDICATOR_VALUE
 # to the value that marks a debit (e.g. field="OGDRCR", value="D"). Leave the
@@ -202,6 +207,3 @@ CBDOC_DEFER_RECENT = _env("CBDOC_DEFER_RECENT", "false").lower() == "true"
 MHA_RESPONSE_KEY_B64 = _env("MHA_RESPONSE_KEY_B64", "")
 # Gateway endpoint that forwards the encrypted response to MHA.
 MHA_RESPONSE_PATH = _env("MHA_RESPONSE_PATH", "/api/v1/mha-response")
-# JSON field name that carries the base64(iv+ciphertext) string in the request
-# body to the MHA-response endpoint. Set to match what MHA/the gateway expects.
-MHA_RESPONSE_FIELD = _env("MHA_RESPONSE_FIELD", "data")
