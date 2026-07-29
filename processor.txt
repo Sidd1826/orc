@@ -1121,7 +1121,7 @@ MHA_INVALID_RRN      = "02"   # Invalid RRN
 def _mha_money_transfer_to(*, rrn: str, payee_bank: str, payee_bank_code: str,
                            payee_account: str, amount: str, txn_datetime: str,
                            disputed: str, root_account: str,
-                           effective_balance: str = "",
+                           ifsc: str = "", effective_balance: str = "",
                            status_code: str = MHA_OK, remarks: str = "") -> dict:
     """MHA 'Money Transfer To' (txn_type_id 3) — exact field set.
 
@@ -1139,7 +1139,7 @@ def _mha_money_transfer_to(*, rrn: str, payee_bank: str, payee_bank_code: str,
         "amount":                  amount,
         "transaction_datetime":    txn_datetime,
         "disputed_amount":         disputed,
-        "ifsc_code":               MHA_IFSC,
+        "ifsc_code":               ifsc or MHA_IFSC,   # pyIfscCode, else "NA"
         "txn_type":                "Money Transfer To",
         "txn_type_id":             "3",
         "phone_number":            "",
@@ -1217,6 +1217,7 @@ def _mha_debit_obj(rrn: str, rtype: str, amount: Decimal, txn: dict,
         payee_bank=bene.get("bank", ""),
         payee_bank_code=bene.get("bankCode", ""),
         payee_account=bene.get("account", ""),
+        ifsc=bene.get("ifsc", ""),
         amount=str(amount),
         txn_datetime=bene.get("txn_datetime") or _fmt_txn_time(txn),
         disputed=str(disputed),
@@ -1609,16 +1610,36 @@ def _normalise_bene(data: dict) -> dict:
 
     bene = {
         "account":  g("pyAccNo"),          # -> payee_account_number
-        "ifsc":     g("pyIfscCode"),
-        "bank":     g("bankName"),
-        "bankCode": g("bankCode"),
+        "ifsc":     g("pyIfscCode"),       # -> ifsc_code
+        "bank":     g("bankName"),         # -> payee_bank
+        "bankCode": g("bankCode"),         # -> payee_bank_code
         "name":     g("pyFname"),
         "vpa":      g("pyFvaddr"),
+        "txn_datetime": _fmt_upi_date(g("txnDate")),   # -> transaction_datetime
     }
     if not bene["account"]:
         log.warning("UPI bene: pyAccNo not found. payload keys=%s",
                     list(data.keys()) if isinstance(data, dict) else type(data).__name__)
+    else:
+        log.info("UPI bene -> acct=%s bank=%s code=%s ifsc=%s txnDate=%s",
+                 bene["account"], bene["bank"], bene["bankCode"],
+                 bene["ifsc"], bene["txn_datetime"])
     return bene
+
+
+def _fmt_upi_date(raw: str) -> str:
+    """UPI txnDate 'YYYY/MM/DD HH:MM:SS' -> MHA 'YYYY-MM-DD HH:MM:SS'."""
+    t = (raw or "").strip()
+    if not t:
+        return ""
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                "%d-%m-%Y %H:%M:%S", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(t, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    log.warning("UPI txnDate unparsed: %r", raw)
+    return t.replace("/", "-")          # best effort
 
 
 def _upi_bene_for(s: Session, p: ComplaintProcessing, rrn: str) -> dict:
@@ -1870,8 +1891,10 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
             payee_bank=bene.get("bank", ""),
             payee_bank_code=bene.get("bankCode", ""),
             payee_account=bene.get("account", ""),
+            ifsc=bene.get("ifsc", ""),
             amount=str(inc.amount),
-            txn_datetime=f"{inc.transaction_date} {inc.transaction_time}",
+            txn_datetime=bene.get("txn_datetime")
+                         or f"{inc.transaction_date} {inc.transaction_time}",
             disputed=str(inc.disputed_amount),
             root_account=root["root_account_number"],
             effective_balance=root["root_effective_balance"],
