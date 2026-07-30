@@ -1120,7 +1120,7 @@ MHA_INVALID_RRN      = "02"   # Invalid RRN
 
 def _mha_money_transfer_to(*, rrn: str, payee_bank: str, payee_bank_code: str,
                            payee_account: str, amount: str, txn_datetime: str,
-                           disputed: str, root_account: str,
+                           disputed: str, root_account: str, root_bankid: str = "",
                            ifsc: str = "", effective_balance: str = "",
                            status_code: str = MHA_OK, remarks: str = "") -> dict:
     """MHA 'Money Transfer To' (txn_type_id 3) — exact field set.
@@ -1147,7 +1147,7 @@ def _mha_money_transfer_to(*, rrn: str, payee_bank: str, payee_bank_code: str,
         "pan_number":              "",
         "root_account_number":     root_account,       # <- accNo (request)
         "root_rrn_transaction_id": rrn,                # mirrors rrn_transaction_id
-        "root_bankid":             payee_bank_code,    # mirrors payee_bank_code
+        "root_bankid":             root_bankid,        # instrument.payer_bank_code
         "status_code":             status_code,
         "remarks":                 remarks,
         "root_effective_balance":  effective_balance,
@@ -1222,6 +1222,7 @@ def _mha_debit_obj(rrn: str, rtype: str, amount: Decimal, txn: dict,
         txn_datetime=bene.get("txn_datetime") or _fmt_txn_time(txn),
         disputed=str(disputed),
         root_account=root["root_account_number"],
+        root_bankid=root["root_bankid"],
         effective_balance=root["root_effective_balance"],
         status_code=code,
         remarks=remarks,
@@ -1612,7 +1613,10 @@ def _normalise_bene(data: dict) -> dict:
         "account":  g("pyAccNo"),          # -> payee_account_number
         "ifsc":     g("pyIfscCode"),       # -> ifsc_code
         "bank":     g("bankName"),         # -> payee_bank
-        "bankCode": g("bankCode"),         # -> payee_bank_code
+        # NOTE: UPI's `bankCode` is NOT mapped. In real responses it repeats the
+        # IFSC (e.g. bankCode == pyIfscCode == "HSBC0400002"), so feeding it into
+        # payee_bank_code polluted that field (and root_bankid) with an IFSC.
+        "bankCode": "",
         "name":     g("pyFname"),
         "vpa":      g("pyFvaddr"),
         "txn_datetime": _fmt_upi_date(g("txnDate")),   # -> transaction_datetime
@@ -1621,9 +1625,8 @@ def _normalise_bene(data: dict) -> dict:
         log.warning("UPI bene: pyAccNo not found. payload keys=%s",
                     list(data.keys()) if isinstance(data, dict) else type(data).__name__)
     else:
-        log.info("UPI bene -> acct=%s bank=%s code=%s ifsc=%s txnDate=%s",
-                 bene["account"], bene["bank"], bene["bankCode"],
-                 bene["ifsc"], bene["txn_datetime"])
+        log.info("UPI bene -> acct=%s bank=%s ifsc=%s txnDate=%s",
+                 bene["account"], bene["bank"], bene["ifsc"], bene["txn_datetime"])
     return bene
 
 
@@ -1665,6 +1668,7 @@ def _to_mha_txn(row: dict, root: dict, disputed: Decimal,
         txn_datetime=_fmt_row_dt(row),
         disputed=str(disputed),
         root_account=root["root_account_number"],
+        root_bankid=root["root_bankid"],
         effective_balance=root["root_effective_balance"],
         remarks=row.get("OGNAR1", "") or "",
     )
@@ -1755,6 +1759,7 @@ def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Inc
                          or f"{inc.transaction_date} {inc.transaction_time}",
             disputed=str(inc.disputed_amount),
             root_account=root["root_account_number"],
+        root_bankid=root["root_bankid"],
             effective_balance=root["root_effective_balance"],
             remarks=row.get("OGNAR1", "") or "",
         ))
@@ -1866,6 +1871,7 @@ def _finalize_dd_probe(s: Session, p: ComplaintProcessing, instrument: Instrumen
                          or f"{inc.transaction_date} {inc.transaction_time}",
             disputed=str(inc.disputed_amount),
             root_account=account,
+            root_bankid=root["root_bankid"],
             effective_balance=root["root_effective_balance"],
             remarks="Retrieved from transaction enquiry"))
 
@@ -1897,6 +1903,7 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
                          or f"{inc.transaction_date} {inc.transaction_time}",
             disputed=str(inc.disputed_amount),
             root_account=root["root_account_number"],
+        root_bankid=root["root_bankid"],
             effective_balance=root["root_effective_balance"],
         ))
     _write_response_log(s, p, {
@@ -1971,3 +1978,4 @@ def _send_mha_response(s: Session, p: ComplaintProcessing, payload: dict) -> Non
         _step_record(s, p, "MHA_RESPONSE", idem,
                      {"acknowledgement_no": p.acknowledgement_no},
                      {"error": str(e)}, status="FAILURE")
+
