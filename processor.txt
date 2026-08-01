@@ -1981,3 +1981,4 @@ def _send_mha_response(s: Session, p: ComplaintProcessing, payload: dict) -> Non
         _step_record(s, p, "MHA_RESPONSE", idem,
                      {"acknowledgement_no": p.acknowledgement_no},
                      {"error": str(e)}, status="FAILURE")
+
