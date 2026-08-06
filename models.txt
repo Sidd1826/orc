@@ -171,6 +171,9 @@ class ApiResponseLog(Base):
     response_code: Mapped[str] = mapped_column(String(10))       # "00" = success
     response_message: Mapped[str] = mapped_column(ApiResponseStatus, default="SUCCESS")
     response_payload: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # Decrypted acknowledgement returned by MHA for this job (matched by the
+    # job_id embedded in the ack's `message` field).
+    acknowledgement_mha: Mapped[Optional[dict]] = mapped_column(JSONB)
     is_success: Mapped[bool] = mapped_column(Computed("response_code = '00'", persisted=True))
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     responded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

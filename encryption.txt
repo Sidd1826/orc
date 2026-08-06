@@ -17,7 +17,7 @@ import os
 from typing import Any
 
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
+from Crypto.Util.Padding import pad, unpad
 
 import config
 
@@ -54,6 +54,26 @@ def encrypt_payload(payload: dict[str, Any]) -> str:
     cipher = AES.new(_key(), AES.MODE_CBC, iv)
     ciphertext = cipher.encrypt(pad(plain.encode("utf-8"), AES.block_size))
     return base64.b64encode(iv + ciphertext).decode("utf-8")
+
+
+def decrypt_payload(base64_encrypted_text: str) -> dict[str, Any]:
+    """Inverse of encrypt_payload — decrypt an MHA acknowledgement.
+
+    Input is base64( iv[16] + ciphertext ); the first 16 bytes are the IV.
+    Returns the decoded JSON dict. Raises on bad input / wrong key.
+    """
+    if not base64_encrypted_text:
+        raise ValueError("Empty encrypted text")
+
+    cleaned = base64_encrypted_text.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+    blob = base64.b64decode(cleaned)
+    if len(blob) <= IV_SIZE:
+        raise ValueError("Encrypted blob too short to contain IV + ciphertext")
+
+    iv, ciphertext = blob[:IV_SIZE], blob[IV_SIZE:]
+    cipher = AES.new(_key(), AES.MODE_CBC, iv)
+    plain = unpad(cipher.decrypt(ciphertext), AES.block_size)
+    return json.loads(plain.decode("utf-8"))
 
 
 def is_enabled() -> bool:

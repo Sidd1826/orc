@@ -62,6 +62,10 @@ ALTER TABLE processing_steps
 ALTER TABLE processing_steps
     ADD COLUMN IF NOT EXISTS attempt         INT NOT NULL DEFAULT 1;
 
+-- Decrypted acknowledgement returned by MHA for each job
+ALTER TABLE api_response_logs
+    ADD COLUMN IF NOT EXISTS acknowledgement_mha JSONB;
+
 
 -- -----------------------------------------------------------------------------
 -- 3. Indexes (idempotent)

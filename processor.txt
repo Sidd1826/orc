@@ -1948,6 +1948,78 @@ def _write_response_log(s: Session, p: ComplaintProcessing, payload: dict,
     _send_mha_response(s, p, payload)
 
 
+_JOB_ID_RE = re.compile(r"BANKS-[0-9a-fA-F-]{8,}")
+
+
+def _extract_encrypted_ack(res: Any) -> str:
+    """Pull the encrypted base64 ack string out of the gateway's reply.
+
+    The gateway wraps the upstream body as {"requestId":..., "data": <body>},
+    and because MHA replies with a bare text/plain string, `data` is usually
+    {"raw": "<base64>"}. Tolerate the other shapes too.
+    """
+    if isinstance(res, str):
+        return res
+    if not isinstance(res, dict):
+        return ""
+    data = res.get("data", res)
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict):
+        for k in ("raw", "response", "body", "data", "responseMsg"):
+            v = data.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+    return ""
+
+
+def _store_mha_ack(s: Session, p: ComplaintProcessing, res: Any) -> None:
+    """Decrypt MHA's acknowledgement and store it on the matching
+    api_response_logs row.
+
+    The ack's `message` carries our job_id, e.g.
+      "Response has been successfully added. BANKS-8996cda1-..."
+    That job_id is the identifier used to find the row. Entirely non-fatal —
+    a failure here must never undo a successfully-sent response.
+    """
+    encrypted_ack = _extract_encrypted_ack(res)
+    if not encrypted_ack:
+        log.warning("[%s] MHA ack: no encrypted body found in gateway reply",
+                    p.acknowledgement_no)
+        return
+
+    try:
+        ack = encryption.decrypt_payload(encrypted_ack)
+    except Exception as e:                       # noqa: BLE001
+        log.error("[%s] MHA ack decryption failed: %s", p.acknowledgement_no, e)
+        return
+
+    # job_id from the ack message; fall back to this complaint's own job_id.
+    message = str(ack.get("message", "") or "")
+    m = _JOB_ID_RE.search(message)
+    job_id = m.group(0) if m else p.job_id
+    if m and job_id != p.job_id:
+        log.warning("[%s] MHA ack job_id=%s differs from current job_id=%s "
+                    "— storing against the ack's job_id",
+                    p.acknowledgement_no, job_id, p.job_id)
+
+    row = s.execute(
+        select(ApiResponseLog).where(ApiResponseLog.job_id == job_id)
+    ).scalar_one_or_none()
+    if not row:
+        log.warning("[%s] MHA ack: no api_response_logs row for job_id=%s",
+                    p.acknowledgement_no, job_id)
+        return
+
+    row.acknowledgement_mha = ack
+    row.responded_at = _now()
+    s.add(row)
+    s.flush()
+    log.info("[%s] MHA ack stored job_id=%s status=%s/%s",
+             p.acknowledgement_no, job_id,
+             ack.get("statuscode"), ack.get("status_message"))
+
+
 def _send_mha_response(s: Session, p: ComplaintProcessing, payload: dict) -> None:
     """Encrypt the response payload and POST it to the gateway's MHA-response
     endpoint. Idempotent (skips if already sent) and non-fatal: a send failure
@@ -1976,6 +2048,7 @@ def _send_mha_response(s: Session, p: ComplaintProcessing, payload: dict) -> Non
         _step_record(s, p, "MHA_RESPONSE", idem,
                      {"acknowledgement_no": p.acknowledgement_no}, res)
         log.info("[%s] MHA response sent OK", p.acknowledgement_no)
+        _store_mha_ack(s, p, res)
     except GatewayError as e:
         log.error("[%s] MHA response send failed (non-fatal): %s", p.acknowledgement_no, e)
         _step_record(s, p, "MHA_RESPONSE", idem,

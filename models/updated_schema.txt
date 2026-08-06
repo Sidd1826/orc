@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS api_response_logs (
     response_code       VARCHAR(10)     NOT NULL,   -- "00" = success, store as-is
     response_message    api_response_status NOT NULL DEFAULT 'SUCCESS',
     response_payload    JSONB,                       -- full collated response
+    acknowledgement_mha JSONB,                       -- MHA's decrypted ack for this job
     is_success          BOOLEAN         GENERATED ALWAYS AS (
                             response_code = '00'
                         ) STORED,
