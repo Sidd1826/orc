@@ -35,6 +35,7 @@ from sqlalchemy import or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+import bank_codes
 import config
 import encryption
 from classifier import (CHANNEL_UPI, DIR_CREDIT, DIR_DEBIT, classify,
@@ -1210,6 +1211,24 @@ _LEG_STATUS = {
 }
 
 
+def _leg_bank_code(bene: dict, txn: dict) -> str:
+    """Bank code for a traced debit leg.
+
+    UPI legs carry an IFSC / bank name / VPA, so those resolve directly.
+    NEFT/RTGS legs come from CBDOC with NO IFSC, so fall back to scanning the
+    DD transaction's narratives, where the bank is usually named.
+    """
+    code = bank_codes.resolve_bank_code(
+        ifsc=bene.get("ifsc", ""), bank_name=bene.get("bank", ""))
+    if code != config.MHA_DEFAULT_BANK_CODE:
+        return code
+
+    code, matched = bank_codes.resolve_from_narratives(_narratives(txn))
+    if matched:
+        log.info("leg bank resolved from DD narrative %r -> code=%s", matched, code)
+    return code
+
+
 def _mha_debit_obj(rrn: str, rtype: str, amount: Decimal, txn: dict,
                    bene: dict, root: dict, disputed: Decimal,
                    bene_status: str = "resolved") -> dict:
@@ -1218,7 +1237,7 @@ def _mha_debit_obj(rrn: str, rtype: str, amount: Decimal, txn: dict,
     return _mha_money_transfer_to(
         rrn=rrn,
         payee_bank=bene.get("bank", ""),
-        payee_bank_code=bene.get("bankCode", ""),
+        payee_bank_code=_leg_bank_code(bene, txn),
         payee_account=bene.get("account", ""),
         ifsc=bene.get("ifsc", ""),
         amount=str(amount),
@@ -1755,7 +1774,7 @@ def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Inc
         txns.append(_mha_money_transfer_to(
             rrn=inc.merchant_id,
             payee_bank=name,                 # CBDOC OGBEA1-4 = beneficiary name
-            payee_bank_code="",
+            payee_bank_code=bank_codes.resolve_bank_code(narrative=name),
             payee_account=_strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
             amount=str(inc.amount),
             txn_datetime=_fmt_row_dt(row)
@@ -1898,7 +1917,8 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
         txns.append(_mha_money_transfer_to(
             rrn=inc.merchant_id,
             payee_bank=bene.get("bank", ""),
-            payee_bank_code=bene.get("bankCode", ""),
+            payee_bank_code=bank_codes.resolve_bank_code(
+                ifsc=bene.get("ifsc", ""), bank_name=bene.get("bank", "")),
             payee_account=bene.get("account", ""),
             ifsc=bene.get("ifsc", ""),
             amount=str(inc.amount),
