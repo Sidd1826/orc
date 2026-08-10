@@ -196,7 +196,26 @@ class BankCodeRegistry:
                     return str(row[k]).strip()
         return ""
 
+    @staticmethod
+    def _resolve_path(path: str) -> str:
+        """Find the reference file.
+
+        A bare filename like 'bank_codes.json' is resolved against the CWD
+        first, then against this module's own directory — on Cloud Run the CWD
+        is not guaranteed to be the app directory, and a silently missing file
+        would make every payee_bank_code fall back to the default.
+        """
+        if not path:
+            return ""
+        if os.path.isabs(path):
+            return path
+        if os.path.exists(path):
+            return os.path.abspath(path)
+        sibling = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        return sibling if os.path.exists(sibling) else path
+
     def _load(self, path: str) -> None:
+        path = self._resolve_path(path)
         if not path or not os.path.exists(path):
             log.warning("bank code list not found at %r — payee_bank_code will "
                         "fall back to %s", path, config.MHA_DEFAULT_BANK_CODE)
