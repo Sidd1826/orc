@@ -1,0 +1,368 @@
+"""
+bank_codes.py — resolve a beneficiary to an MHA bank code.
+
+The problem: MHA expects a numeric `payee_bank_code` from a ~1600-row list of
+banks / wallets / merchants, but the upstream APIs only give us loose signals
+(an IFSC, a bank short-name, a CBDOC narrative).
+
+Strategy, strongest signal first:
+
+  1. IFSC PREFIX  — the first 4 chars of an Indian IFSC are the bank's RBI
+                    identifier (UTIB=Axis, HDFC=HDFC, SBIN=SBI...). This is
+                    exact and is the preferred path. The UPI API returns
+                    `pyIfscCode`, so most UPI legs resolve here.
+  NOTE: the VPA handle is deliberately NOT used. '...@okaxis' identifies the
+        PSP app, not where the account is actually held — a customer of any
+        bank can use any handle — so it is not evidence of the payee's bank.
+  2. EXACT NAME   — normalised exact match against the code list.
+  3. ALIAS        — common abbreviations (SBI, BOB, PNB...).
+  4. FUZZY NAME   — token-overlap + similarity, above a confidence floor.
+
+Anything unresolved returns the configured default ("00") rather than guessing,
+because a WRONG bank code is worse than an absent one.
+
+The code list is loaded once from config.BANK_CODES_PATH — a JSON array of:
+    {"Bank Code": 3, "Bank/FIs": "Axis Bank", "Bank/FIs Type": "BNK"}
+Field names are matched loosely, so minor header differences still work.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from typing import Optional
+
+import config
+from logger import get_logger
+
+log = get_logger(__name__)
+
+TYPE_BANK     = "BNK"
+TYPE_WALLET   = "WLT"
+TYPE_MERCHANT = "MER"
+
+
+# ---------------------------------------------------------------------------
+# IFSC prefix -> canonical bank name. The first 4 chars of an IFSC are the
+# bank identifier. Extend freely; unknown prefixes just fall through.
+# ---------------------------------------------------------------------------
+IFSC_PREFIX_TO_BANK: dict[str, str] = {
+    "SBIN": "State Bank of India",
+    "HDFC": "HDFC Bank",
+    "ICIC": "ICICI Bank",
+    "UTIB": "Axis Bank",
+    "PUNB": "Punjab National Bank",
+    "BARB": "Bank of Baroda",
+    "CNRB": "Canara Bank",
+    "UBIN": "Union Bank of India",
+    "IOBA": "Indian Overseas Bank",
+    "IDIB": "Indian Bank",
+    "CBIN": "Central Bank of India",
+    "MAHB": "Bank of Maharashtra",
+    "BKID": "Bank of India",
+    "UCBA": "UCO Bank",
+    "PSIB": "Punjab and Sind Bank",
+    "KKBK": "Kotak Mahindra Bank",
+    "YESB": "Yes Bank",
+    "INDB": "IndusInd Bank",
+    "IDFB": "IDFC First Bank",
+    "FDRL": "Federal Bank",
+    "RATN": "RBL Bank",
+    "SIBL": "South Indian Bank",
+    "KARB": "Karnataka Bank",
+    "CIUB": "City Union Bank",
+    "TMBL": "Tamilnad Mercantile Bank",
+    "DCBL": "DCB Bank",
+    "BDBL": "Bandhan Bank",
+    "AUBL": "AU Small Finance Bank",
+    "ESFB": "Equitas Small Finance Bank",
+    "UJVN": "Ujjivan Small Finance Bank",
+    "JSFB": "Jana Small Finance Bank",
+    "KVBL": "Karur Vysya Bank",
+    "SRCB": "Saraswat Bank",
+    "HSBC": "HSBC",
+    "CITI": "Citibank",
+    "SCBL": "Standard Chartered Bank",
+    "DEUT": "Deutsche Bank",
+    "BOFA": "Bank of America",
+    "CHAS": "JP Morgan Chase Bank",
+    "DBSS": "DBS Bank",
+    "BKDN": "Dena Bank",
+    "VIJB": "Vijaya Bank",
+    "SYNB": "Syndicate Bank",
+    "ANDB": "Andhra Bank",
+    "CORP": "Corporation Bank",
+    "ALLA": "Allahabad Bank",
+    "ORBC": "Oriental Bank of Commerce",
+    "UTBI": "United Bank of India",
+    "PYTM": "Paytm Payments Bank",
+    "AIRP": "Airtel Payments Bank",
+    "IPOS": "India Post Payments Bank",
+    "FINO": "Fino Payments Bank",
+    "NSPB": "NSDL Payments Bank",
+}
+
+# Common abbreviations / alternate spellings -> canonical name.
+NAME_ALIASES: dict[str, str] = {
+    "sbi": "State Bank of India",
+    "bob": "Bank of Baroda",
+    "pnb": "Punjab National Bank",
+    "boi": "Bank of India",
+    "bom": "Bank of Maharashtra",
+    "cbi": "Central Bank of India",
+    "obc": "Oriental Bank of Commerce",
+    "iob": "Indian Overseas Bank",
+    "kmbl": "Kotak Mahindra Bank",
+    "rbl": "RBL Bank",
+    "idfc": "IDFC First Bank",
+    "scb": "Standard Chartered Bank",
+    "hsbc bank": "HSBC",
+    "axis": "Axis Bank",
+    "icici": "ICICI Bank",
+    "hdfc": "HDFC Bank",
+}
+
+# Tokens that carry no discriminating power when comparing names.
+_STOPWORDS = {
+    "bank", "banks", "of", "the", "ltd", "limited", "co", "corporation",
+    "india", "indian", "and", "&", "pvt", "private", "fis", "fi", "wallet",
+    "payments", "payment", "services", "service", "finance", "financial",
+}
+
+_FUZZY_FLOOR = 0.86      # below this we refuse to guess
+
+
+def _norm(s: str) -> str:
+    """Lowercase, drop parentheticals and punctuation, collapse whitespace."""
+    s = (s or "").lower()
+    s = re.sub(r"\([^)]*\)", " ", s)          # "(including Vijaya Bank)" -> ""
+    s = s.replace("&", " and ")
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _strip_parens(s: str) -> str:
+    """'Bank of Baroda (Including Vijaya Bank)' -> 'Bank of Baroda'."""
+    return re.sub(r"\([^)]*\)", " ", s or "").strip()
+
+
+def _parenthetical_names(s: str) -> list[str]:
+    """Pull the merged-bank names out of a parenthetical.
+
+    'Bank of Baroda (Including Vijaya Bank and Dena Bank)'
+        -> ['Vijaya Bank', 'Dena Bank']
+    """
+    out: list[str] = []
+    for inner in re.findall(r"\(([^)]*)\)", s or ""):
+        inner = re.sub(r"(?i)\b(including|incl|and other|erstwhile)\b", " ", inner)
+        for part in re.split(r"(?i)\s+and\s+|,|/|&", inner):
+            part = part.strip(" .")
+            if len(part) > 3:
+                out.append(part)
+    return out
+
+
+def _tokens(s: str) -> frozenset[str]:
+    return frozenset(t for t in _norm(s).split() if t not in _STOPWORDS)
+
+
+@dataclass(frozen=True)
+class BankMatch:
+    code: str
+    name: str
+    type: str
+    method: str          # ifsc | exact | alias | fuzzy | default
+    confidence: float
+
+
+class BankCodeRegistry:
+    """Loads the code list once and resolves beneficiaries against it."""
+
+    def __init__(self, path: str = "") -> None:
+        self._by_norm: dict[str, dict] = {}
+        self._by_tokens: list[tuple[frozenset[str], dict]] = []
+        self._entries: list[dict] = []
+        self._load(path or config.BANK_CODES_PATH)
+
+    # -- loading ---------------------------------------------------------
+    @staticmethod
+    def _field(row: dict, *candidates: str) -> str:
+        """Fetch a field tolerantly (header spellings vary)."""
+        for c in candidates:
+            for k in row:
+                if k.strip().lower() == c.strip().lower():
+                    return str(row[k]).strip()
+        return ""
+
+    def _load(self, path: str) -> None:
+        if not path or not os.path.exists(path):
+            log.warning("bank code list not found at %r — payee_bank_code will "
+                        "fall back to %s", path, config.MHA_DEFAULT_BANK_CODE)
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except Exception as e:                            # noqa: BLE001
+            log.error("failed to read bank code list %r: %s", path, e)
+            return
+
+        rows = raw.get("banks", raw) if isinstance(raw, dict) else raw
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            code = self._field(row, "Bank Code", "bank_code", "code")
+            name = self._field(row, "Bank/FIs", "bank_fis", "name", "bank")
+            btype = self._field(row, "Bank/FIs Type", "bank_fis_type", "type") or TYPE_BANK
+            if not code or not name:
+                continue
+            entry = {"code": str(code).strip(), "name": name, "type": btype.upper()}
+            self._entries.append(entry)
+            self._by_norm.setdefault(_norm(name), entry)
+            toks = _tokens(name)
+            if toks:
+                self._by_tokens.append((toks, entry))
+
+            # Index names listed in parentheses too. MHA's list folds merged
+            # banks into the surviving entity, e.g.
+            #   "Bank of Baroda (Including Vijaya Bank and Dena Bank)"
+            #   "Canara Bank (including Syndicate Bank)"
+            # so a narrative naming the OLD bank must resolve to the parent code.
+            for sub in _parenthetical_names(name):
+                self._by_norm.setdefault(_norm(sub), entry)
+                sub_toks = _tokens(sub)
+                if sub_toks:
+                    self._by_tokens.append((sub_toks, entry))
+            # ...and the name with the parenthetical stripped off
+            base = _strip_parens(name).strip()
+            if base and base != name:
+                self._by_norm.setdefault(_norm(base), entry)
+
+        log.info("bank code registry loaded: %d entries from %s",
+                 len(self._entries), path)
+
+    @property
+    def size(self) -> int:
+        return len(self._entries)
+
+    # -- lookup helpers --------------------------------------------------
+    def _lookup_name(self, name: str, type_hint: str = "") -> Optional[tuple[dict, str, float]]:
+        n = _norm(name)
+        if not n:
+            return None
+
+        e = self._by_norm.get(n)
+        if e and (not type_hint or e["type"] == type_hint):
+            return e, "exact", 1.0
+
+        alias = NAME_ALIASES.get(n)
+        if alias:
+            e = self._by_norm.get(_norm(alias))
+            if e and (not type_hint or e["type"] == type_hint):
+                return e, "alias", 0.99
+
+        # token-overlap shortlist, then similarity to break ties
+        want = _tokens(name)
+        if not want:
+            return None
+        best, best_score = None, 0.0
+        for toks, entry in self._by_tokens:
+            if type_hint and entry["type"] != type_hint:
+                continue
+            if not (toks & want):
+                continue
+            jac = len(toks & want) / len(toks | want)
+            sim = SequenceMatcher(None, n, _norm(entry["name"])).ratio()
+            score = max(jac, sim) if toks <= want or want <= toks else (jac + sim) / 2
+            if score > best_score:
+                best, best_score = entry, score
+        if best and best_score >= _FUZZY_FLOOR:
+            return best, "fuzzy", best_score
+        return None
+
+    # -- public API ------------------------------------------------------
+    def resolve(self, *, ifsc: str = "", bank_name: str = "",
+                narrative: str = "", type_hint: str = "") -> BankMatch:
+        """Resolve a beneficiary to a bank code, strongest signal first."""
+        default = BankMatch(config.MHA_DEFAULT_BANK_CODE, "", "", "default", 0.0)
+        if not self._entries:
+            return default
+
+        # 1. IFSC prefix — exact and preferred
+        prefix = (ifsc or "").strip().upper()[:4]
+        if len(prefix) == 4:
+            canon = IFSC_PREFIX_TO_BANK.get(prefix)
+            if canon:
+                hit = self._lookup_name(canon, TYPE_BANK) or self._lookup_name(canon)
+                if hit:
+                    e, _, _ = hit
+                    return BankMatch(e["code"], e["name"], e["type"], "ifsc", 1.0)
+
+        # 2/3/4. Name -> exact, alias, fuzzy
+        for candidate in (bank_name, narrative):
+            if not candidate:
+                continue
+            hit = self._lookup_name(candidate, type_hint)
+            if hit:
+                e, method, score = hit
+                return BankMatch(e["code"], e["name"], e["type"], method, score)
+
+        return default
+
+
+_registry: Optional[BankCodeRegistry] = None
+
+
+def registry() -> BankCodeRegistry:
+    global _registry
+    if _registry is None:
+        _registry = BankCodeRegistry()
+    return _registry
+
+
+def resolve_from_narratives(narratives: list[str], *,
+                            type_hint: str = "") -> tuple[str, str]:
+    """Scan DD transaction narratives for something that looks like a bank name.
+
+    NEFT/RTGS legs carry no IFSC, but the DD transaction enquiry usually names
+    the bank in one of its narrative lines. Returns (code, matched_narrative);
+    the code is the configured default when nothing resolves.
+
+    Junk lines are skipped so we never fuzzy-match noise: pure digits, very
+    short strings, UTR-shaped tokens (HSBCN…/HSBCR…) and date/amount fragments.
+    """
+    reg = registry()
+    for nv in narratives or []:
+        t = (nv or "").strip()
+        if len(t) < 4:
+            continue
+        compact = t.replace(" ", "")
+        if compact.isdigit():                                  # RRN / account
+            continue
+        if re.fullmatch(r"(?i)(HSBC[NR]|UPI)[A-Z0-9]+", compact):   # UTR-ish
+            continue
+        if re.fullmatch(r"[\d/:\-.\s]+", t):                   # dates / amounts
+            continue
+
+        m = reg.resolve(bank_name=t, type_hint=type_hint)
+        if m.method != "default":
+            log.info("bank code %s (%s) from narrative %r via %s conf=%.2f",
+                     m.code, m.name, t, m.method, m.confidence)
+            return m.code, t
+
+    return config.MHA_DEFAULT_BANK_CODE, ""
+
+
+def resolve_bank_code(*, ifsc: str = "", bank_name: str = "",
+                      narrative: str = "", type_hint: str = "") -> str:
+    """Convenience wrapper — returns just the code string."""
+    m = registry().resolve(ifsc=ifsc, bank_name=bank_name,
+                           narrative=narrative, type_hint=type_hint)
+    if m.method == "default":
+        log.warning("bank code unresolved (ifsc=%r name=%r) -> %s",
+                    ifsc, bank_name, m.code)
+    else:
+        log.info("bank code %s (%s) via %s conf=%.2f",
+                 m.code, m.name, m.method, m.confidence)
+    return m.code
