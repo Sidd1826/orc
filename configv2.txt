@@ -1,0 +1,306 @@
+"""
+config.py — Central config for the MHA Gateway (Cloud Run service).
+
+Resolution order for every value:
+  1. Real environment variable (Cloud Run --set-env-vars, or shell export)
+  2. .env file (local dev only, via python-dotenv)
+  3. Hardcoded default below
+
+SECRETS are different: on GCP they are pulled from Secret Manager at import
+time and injected into os.environ *before* any config value is read, so the
+plain `_env(...)` calls below pick them up transparently.
+
+Two kinds of secrets are supported:
+  - String secrets -> injected as env vars           (_SECRET_STRINGS)
+  - File secrets   -> written to disk; the env var   (_SECRET_FILES)
+                      then holds the resulting path
+
+Secret Manager is only contacted when GOOGLE_CLOUD_PROJECT (or GCP_PROJECT_ID)
+is set. Locally everything falls back to .env — no GCP credentials needed.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)          # real env vars always win
+except ImportError:
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Small env helpers
+# ---------------------------------------------------------------------------
+
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    return float(raw) if raw else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    return int(raw) if raw else default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# Secret Manager
+# ---------------------------------------------------------------------------
+
+PROJECT_ID: str = _env("GOOGLE_CLOUD_PROJECT") or _env("GCP_PROJECT_ID")
+ON_GCP: bool = bool(PROJECT_ID)
+
+# Where file-type secrets get materialised. /tmp on Cloud Run is an in-memory
+# tmpfs — nothing touches persistent disk and it dies with the container.
+SECRET_DIR: Path = Path(_env("SECRET_DIR", "/tmp/secrets"))
+
+# env var name -> Secret Manager secret name (plain string payloads)
+_SECRET_STRINGS: dict[str, str] = {
+    "UPI_USERNAME":        "UPI_USERNAME",
+    "UPI_PASSWORD":        "UPI_PASSWORD",
+    "UPI_AES_KEY_HEX":     "UPI_AES_KEY_HEX",
+    "HSBC_TOKEN_USERNAME": "HSBC_TOKEN_USERNAME",
+    "HSBC_TOKEN_PASSWORD": "HSBC_TOKEN_PASSWORD",
+}
+
+# env var name -> (Secret Manager secret name, filename written under SECRET_DIR)
+# The secret payload is the *entire file contents* (e.g. the SA JSON blob).
+_SECRET_FILES: dict[str, tuple[str, str]] = {
+    "BQ_SERVICE_ACCOUNT_FILE": ("BQ_SERVICE_ACCOUNT_JSON", "bq-sa.json"),
+}
+
+_client = None  # lazily created SecretManagerServiceClient, reused
+
+
+def _secret_client():
+    global _client
+    if _client is None:
+        try:
+            from google.cloud import secretmanager
+        except ImportError as e:
+            raise RuntimeError(
+                "google-cloud-secret-manager is not installed. "
+                "Run: pip install google-cloud-secret-manager"
+            ) from e
+        _client = secretmanager.SecretManagerServiceClient()
+    return _client
+
+
+def get_secret(secret_name: str, project_id: Optional[str] = None,
+               version: str = "latest") -> str:
+    """Fetch a single secret payload as text. Raises on failure."""
+    project_id = project_id or PROJECT_ID
+    if not project_id:
+        raise ValueError(
+            "No GCP project id — set GOOGLE_CLOUD_PROJECT or GCP_PROJECT_ID"
+        )
+    name = f"projects/{project_id}/secrets/{secret_name}/versions/{version}"
+    try:
+        response = _secret_client().access_secret_version(request={"name": name})
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load secret '{secret_name}' from Secret Manager: {e}"
+        ) from e
+    return response.payload.data.decode("utf-8")
+
+
+def _write_secret_file(secret_name: str, filename: str) -> str:
+    """Materialise a file-shaped secret to disk with 0600 perms. Returns path."""
+    payload = get_secret(secret_name)          # do NOT .strip() — keep bytes intact
+    SECRET_DIR.mkdir(parents=True, exist_ok=True)
+    path = SECRET_DIR / filename
+    # os.open with mode 0600 so the file is never briefly world-readable.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(payload)
+    return str(path)
+
+
+def _load_secrets_from_gcp() -> None:
+    """Pull all configured secrets into os.environ. No-op off GCP."""
+    if not ON_GCP:
+        return
+
+    for env_var, secret_name in _SECRET_STRINGS.items():
+        if os.environ.get(env_var):        # already injected via --set-secrets
+            continue
+        os.environ[env_var] = get_secret(secret_name).strip()
+
+    for env_var, (secret_name, filename) in _SECRET_FILES.items():
+        existing = os.environ.get(env_var)
+        if existing and Path(existing).is_file():
+            continue                       # already mounted as a volume
+        os.environ[env_var] = _write_secret_file(secret_name, filename)
+
+
+# MUST run before any _env(...) call below that touches a secret.
+_load_secrets_from_gcp()
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+LOG_LEVEL: str = _env("LOG_LEVEL", "INFO").upper()
+
+
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+
+HTTP_CONNECT_TIMEOUT: float = _env_float("HTTP_CONNECT_TIMEOUT", 10.0)
+HTTP_READ_TIMEOUT:    float = _env_float("HTTP_READ_TIMEOUT",    30.0)
+HTTP_MAX_RETRIES:     int   = _env_int("HTTP_MAX_RETRIES", 2)
+
+
+# ---------------------------------------------------------------------------
+# UPI
+# ---------------------------------------------------------------------------
+
+UPI_BASE_URL:    str = _env("UPI_BASE_URL",    "https://upi-uat-mob.hsbc.co.in")
+UPI_LOGIN_PATH:  str = _env("UPI_LOGIN_PATH",  "/sha/api/auth/login")
+UPI_SECURE_PATH: str = _env("UPI_SECURE_PATH", "/mha/secure/sha/check")
+
+# SECRET
+UPI_USERNAME:    str = _env("UPI_USERNAME", "")
+UPI_PASSWORD:    str = _env("UPI_PASSWORD", "")
+UPI_AES_KEY_HEX: str = _env("UPI_AES_KEY_HEX", "")
+
+TOKEN_REFRESH_LEEWAY_SEC: int = _env_int("TOKEN_REFRESH_LEEWAY_SEC", 60)
+TOKEN_DEFAULT_TTL_SEC:    int = _env_int("TOKEN_DEFAULT_TTL_SEC", 900)
+
+
+# ---------------------------------------------------------------------------
+# HSBC Hub endpoints
+# ---------------------------------------------------------------------------
+
+HSBC_TRANSACTION_HISTORY_URL: str = _env(
+    "HSBC_TRANSACTION_HISTORY_URL",
+    "https://cbil-in-hbap-hub-dd-trans-history-enq-3.hsbc-cbsa-hub-cert.svc."
+    "apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc"
+    "/api/v3/account/demand-deposit-transaction-history",
+)
+
+HSBC_APPLY_HOLD_URL: str = _env(
+    "HSBC_APPLY_HOLD_URL",
+    "https://cbil-in-hbap-hub-add-acct-hld-pst-2.hsbc-cbsa-hub-cert.svc."
+    "apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc"
+    "/api/accounts/apply-account-holds",
+)
+
+HSBC_DEMAND_DEPOSIT_URL: str = _env(
+    "HSBC_DEMAND_DEPOSIT_URL",
+    "https://cbil-in-hbap-hub-demand-deposit-acct-enq-5.hsbc-cbsa-hub-cert.svc."
+    "apiapg02.shp.ape1.pre-prod.aws.cloud.hsbc"
+    "/api/v5/accounts/demand-deposit-account",
+)
+
+
+# ---------------------------------------------------------------------------
+# HSBC E2E Trust Token — generated dynamically via the DSP token-translator.
+# One token is shared by all three HSBC APIs. It expires in ~60s, so the
+# HSBCHubClient caches it and refreshes shortly before expiry.
+# ---------------------------------------------------------------------------
+
+HSBC_TOKEN_URL: str = _env(
+    "HSBC_TOKEN_URL",
+    "https://cmb-ib2b-dsp-pprod-ap.hk.hsbc:8443"
+    "/dsp/rest-sts/DSP_iB2B/iB2B_tokenTranslator_v2",
+)
+
+HSBC_TOKEN_ACTION: str = _env("HSBC_TOKEN_ACTION", "translate")
+
+# SECRET — credentials exchanged for a JWT
+HSBC_TOKEN_USERNAME: str = _env("HSBC_TOKEN_USERNAME", "")
+HSBC_TOKEN_PASSWORD: str = _env("HSBC_TOKEN_PASSWORD", "")
+
+HSBC_TOKEN_TTL_SEC:            int = _env_int("HSBC_TOKEN_TTL_SEC", 60)
+HSBC_TOKEN_REFRESH_LEEWAY_SEC: int = _env_int("HSBC_TOKEN_REFRESH_LEEWAY_SEC", 10)
+
+HSBC_REQUEST_CORRELATION_ID: str = _env(
+    "HSBC_REQUEST_CORRELATION_ID",
+    "550e8400-e29b-41d4-a716-446655440000",
+)
+
+HSBC_SESSION_CORRELATION_ID: str = _env(
+    "HSBC_SESSION_CORRELATION_ID",
+    "session-12345-abc",
+)
+
+
+# ---------------------------------------------------------------------------
+# BigQuery — auth via service account JSON (a file secret), ids from env
+# ---------------------------------------------------------------------------
+
+BQ_PROJECT_ID: str = _env("BQ_PROJECT_ID", "hsbc-12010755-cbdocinmncb-dev")
+BQ_DATASET_ID: str = _env("BQ_DATASET_ID", "inm_hub_mha_views_dev")
+BQ_TABLE_ID:   str = _env("BQ_TABLE_ID",   "MHA_ORDLJNP_FILTERED")
+
+# Set by _load_secrets_from_gcp() on Cloud Run (/tmp/secrets/bq-sa.json).
+# Locally: point this at your downloaded key file in .env.
+BQ_SERVICE_ACCOUNT_FILE: str = _env("BQ_SERVICE_ACCOUNT_FILE", "")
+
+# Optional CMEK — leave empty unless the dataset requires it.
+BQ_KMS_KEY: str = _env("BQ_KMS_KEY", "")
+
+
+def bq_credentials():
+    """Return SA credentials for BigQuery, or None to fall back to ADC."""
+    if not BQ_SERVICE_ACCOUNT_FILE:
+        return None
+    from google.oauth2 import service_account
+    return service_account.Credentials.from_service_account_file(
+        BQ_SERVICE_ACCOUNT_FILE,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# MHA response callback
+# ---------------------------------------------------------------------------
+
+MHA_RESPONSE_URL:     str   = _env("MHA_RESPONSE_URL", "")
+MHA_RESPONSE_TIMEOUT: float = _env_float("MHA_RESPONSE_TIMEOUT", 30.0)
+
+
+# ---------------------------------------------------------------------------
+# Startup validation — fail fast instead of 500-ing on the first request
+# ---------------------------------------------------------------------------
+
+_REQUIRED = {
+    "UPI_USERNAME":        UPI_USERNAME,
+    "UPI_PASSWORD":        UPI_PASSWORD,
+    "UPI_AES_KEY_HEX":     UPI_AES_KEY_HEX,
+    "HSBC_TOKEN_USERNAME": HSBC_TOKEN_USERNAME,
+    "HSBC_TOKEN_PASSWORD": HSBC_TOKEN_PASSWORD,
+    "BQ_PROJECT_ID":       BQ_PROJECT_ID,
+    "BQ_DATASET_ID":       BQ_DATASET_ID,
+    "BQ_TABLE_ID":         BQ_TABLE_ID,
+}
+
+
+def validate() -> None:
+    missing = [k for k, v in _REQUIRED.items() if not v]
+    if BQ_SERVICE_ACCOUNT_FILE and not Path(BQ_SERVICE_ACCOUNT_FILE).is_file():
+        missing.append(
+            f"BQ_SERVICE_ACCOUNT_FILE (path not found: {BQ_SERVICE_ACCOUNT_FILE})"
+        )
+    if missing:
+        raise RuntimeError("Config incomplete — missing: " + ", ".join(missing))
+
+
+if _env_bool("CONFIG_VALIDATE_ON_IMPORT", True):
+    validate()
