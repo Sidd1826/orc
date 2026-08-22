@@ -80,17 +80,24 @@ def _load_secrets_from_gcp() -> None:
         ) from e
 
     client = secretmanager.SecretManagerServiceClient()
+    loaded, skipped = [], []
     for env_var, secret_name in SECRETS_TO_LOAD.items():
         if os.environ.get(env_var):          # already set -> don't override
+            skipped.append(env_var)
             continue
         try:
             path = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
             resp = client.access_secret_version(request={"name": path})
             os.environ[env_var] = resp.payload.data.decode("utf-8").strip()
+            loaded.append(env_var)
         except Exception as e:               # noqa: BLE001
             raise RuntimeError(
                 f"Failed to load secret '{secret_name}' from Secret Manager: {e}"
             ) from e
+
+    # Names only — never log secret VALUES.
+    print(f"[config] Secret Manager (project={project_id}): "
+          f"loaded={loaded or 'none'} already-set={skipped or 'none'}", flush=True)
 
 
 # Must run BEFORE the settings below are evaluated.
@@ -207,3 +214,9 @@ CBDOC_DEFER_RECENT = _env("CBDOC_DEFER_RECENT", "false").lower() == "true"
 MHA_RESPONSE_KEY_B64 = _env("MHA_RESPONSE_KEY_B64", "")
 # Gateway endpoint that forwards the encrypted response to MHA.
 MHA_RESPONSE_PATH = _env("MHA_RESPONSE_PATH", "/api/v1/mha-response")
+
+# --- MHA bank / wallet / merchant code list ---
+# JSON array of {"Bank Code":.., "Bank/FIs":.., "Bank/FIs Type":..}
+BANK_CODES_PATH       = _env("BANK_CODES_PATH", "bank_codes.json")
+# Used when a beneficiary cannot be resolved to a code (never guess).
+MHA_DEFAULT_BANK_CODE = _env("MHA_DEFAULT_BANK_CODE", "00")
