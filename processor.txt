@@ -346,7 +346,28 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
                                             "UTR not found in DD transaction enquiry")
                     p.processing_state = ST_NEEDS_REVIEW
                     p.last_error = "UTR not validated in DD enquiry (miscellaneous)"
+                elif (not _cbdoc_bene_found(s, p, incidents)
+                      and cls.is_recent
+                      and p.defer_count < config.MAX_CBDOC_DEFERS):
+                    # UTR is valid (DD sees it) but CBDOC has no bene row yet —
+                    # CBDOC is updated T+1. Do NOT send an empty-bene response
+                    # today; park and retry tomorrow 10am IST, then respond once
+                    # with the real beneficiary.
+                    wake = _cbdoc_wake_time(incidents)
+                    p.defer_count += 1
+                    p.next_attempt_at = wake
+                    p.processing_state = ST_AWAITING_CBDOC
+                    p.lease_expires_at = None
+                    log.info("[%s] IB-debit: CBDOC bene empty (same-day fraud); "
+                             "holding response, retry #%d at %s",
+                             p.acknowledgement_no, p.defer_count, wake.isoformat())
+                    s.add(p); s.commit()
+                    break
                 else:
+                    if not _cbdoc_bene_found(s, p, incidents):
+                        log.warning("[%s] IB-debit: CBDOC bene still empty after "
+                                    "%d defer(s) — responding with what we have",
+                                    p.acknowledgement_no, p.defer_count)
                     _finalize_cbdoc_bene(s, p, incidents)
                     p.processing_state = ST_RESOLVED
                 p.lease_expires_at = None
@@ -384,11 +405,17 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
                 p.processing_state = ST_RECONCILING
 
         elif st == ST_AWAITING_CBDOC:
-            # Parked because a NEFT/RTGS leg needed CBDOC data that wasn't there
-            # yet (recent fraud, CBDOC is T+1). Woken next morning -> reconcile
-            # again; CBDOC should now have the data.
+            # Parked because CBDOC had no bene row yet (fraud reported the same
+            # day; CBDOC updates T+1). Woken next morning at 10am IST.
+            #   DEBIT  -> re-run enrichment so the CBDOC lookup is re-issued
+            #             (the step idem key includes defer_count, so it really
+            #             re-queries instead of reusing the cached empty result).
+            #   CREDIT -> reconcile again.
             p.next_attempt_at = None
-            p.processing_state = ST_RECONCILING
+            p.processing_state = (ST_CLASSIFIED if cls.direction == DIR_DEBIT
+                                  else ST_RECONCILING)
+            log.info("[%s] woke from AWAITING_CBDOC (defer #%d) -> %s",
+                     p.acknowledgement_no, p.defer_count, p.processing_state)
 
         elif st == ST_RECONCILING:
             remaining = Decimal(_unstash(s, p, "REMAINING").get("value", "0"))
@@ -570,7 +597,7 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
                 log.info("[%s] UTR=%s MATCHED in DD enquiry", p.acknowledgement_no, inc.merchant_id)
 
             # UTR validated -> fetch bene details from CBDOC by the UTR/RRN.
-            bqidem = f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}"
+            bqidem = f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}:{p.defer_count}"
             if _step_get(s, p, "CBDOC_BENE", bqidem):
                 continue
             bq = gateway().bigquery_search({config.BQ_SEARCH_REF_FIELD: inc.merchant_id}, limit=5)
@@ -1758,13 +1785,27 @@ def _finalize(s: Session, p: ComplaintProcessing, instrument: Instrument,
     _write_response_log(s, p, payload)
 
 
+def _cbdoc_bene_found(s: Session, p: ComplaintProcessing,
+                      incidents: list[Incident]) -> bool:
+    """True if EVERY incident has a CBDOC bene row. Used to decide whether an
+    IB-debit (NEFT/RTGS) response is complete or must wait for the T+1 update."""
+    for inc in incidents:
+        step = _step_get(s, p, "CBDOC_BENE",
+                         f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}:{p.defer_count}")
+        rows = _rows(step.response_payload) if step and step.response_payload else []
+        if not rows:
+            return False
+    return True
+
+
 def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> None:
     """IB Debit: bene details come from the CBDOC row matched by the UTR/RRN.
     One 'Money Transfer To' object per incident. No hold."""
     root = _root_ctx(s, p)
     txns = []
     for inc in incidents:
-        step = _step_get(s, p, "CBDOC_BENE", f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}")
+        step = _step_get(s, p, "CBDOC_BENE",
+                         f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}:{p.defer_count}")
         rows = _rows(step.response_payload) if step and step.response_payload else []
         row = rows[0] if rows else {}
         name = " ".join(
@@ -2074,3 +2115,4 @@ def _send_mha_response(s: Session, p: ComplaintProcessing, payload: dict) -> Non
         _step_record(s, p, "MHA_RESPONSE", idem,
                      {"acknowledgement_no": p.acknowledgement_no},
                      {"error": str(e)}, status="FAILURE")
+
